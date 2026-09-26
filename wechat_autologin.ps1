@@ -1,11 +1,22 @@
 # ============================================================
 # WeChat auto-login script (zero third-party dependency, PowerShell + user32)
-# Flow: start WeChat -> detect login window -> activate ->
+# Flow: start WeChat -> wait for login window -> activate ->
 #       real mouse input (SetCursorPos + mouse_event) click
-#       the "Enter WeChat" button -> enter main window
-# Note: uses real system mouse input; pointer moves to the button.
-# Run : powershell -ExecutionPolicy Bypass -File wechat_autologin.ps1
+#       the "Enter WeChat" button -> enter main window -> exit
+# Design notes:
+#   - Button located by RELATIVE position (% of render window),
+#     so it works across different screen resolutions and DPI scaling.
+#   - Pure ASCII comments (PowerShell 5.1 safe).
+# Run : powershell -NoProfile -ExecutionPolicy Bypass -File wechat_autologin.ps1
+#       optional: -WeChatExe "path" -BtnX 0.498 -BtnY 0.773
 # ============================================================
+param(
+    [string]$WeChatExe = "D:\WeChat\Weixin\Weixin.exe",
+    [string]$WeChatDir = "D:\WeChat\Weixin",
+    [int]$TimeoutSec  = 30,
+    [double]$BtnX     = 0.498,   # "Enter WeChat" button center X (fraction of render width)
+    [double]$BtnY     = 0.773    # "Enter WeChat" button center Y (fraction of render height)
+)
 $ErrorActionPreference = 'Stop'
 
 Add-Type @"
@@ -29,20 +40,25 @@ public class WxApi {
 "@
 [WxApi]::SetProcessDPIAware() | Out-Null
 
-$wxExe = "D:\WeChat\Weixin\Weixin.exe"
 $LEFTDOWN = 0x0002
 $LEFTUP   = 0x0004
+$deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
 
 # 1) Start WeChat if not running
 if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
-    Start-Process -FilePath $wxExe -WorkingDirectory "D:\WeChat\Weixin"
+    if (-not (Test-Path $WeChatExe)) {
+        Write-Host "WeChat not found: $WeChatExe (skip auto-login)"
+        exit 0
+    }
+    Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
+    Start-Sleep -Milliseconds 800   # let WeChat start up
 }
 
-# 2) Find WeChat window (title WeChat, visible, has render child)
+# 2) Wait for WeChat window (title WeChat, visible, has render child)
 Write-Host "Waiting for WeChat window..."
 $script:target = [IntPtr]::Zero
 $script:render = [IntPtr]::Zero
-for ($i=0; $i -lt 120; $i++) {
+while ([DateTime]::Now -lt $deadline) {
     $script:target = [IntPtr]::Zero
     $script:render = [IntPtr]::Zero
     $cb = [WxApi+EnumProc]{
@@ -65,16 +81,16 @@ for ($i=0; $i -lt 120; $i++) {
     }
     [WxApi]::EnumWindows($cb,[IntPtr]::Zero) | Out-Null
     if ($script:target -ne [IntPtr]::Zero) { break }
-    Start-Sleep -Milliseconds 200
+    Start-Sleep -Milliseconds 250
 }
 
 $win = $script:target
 if ($win -eq [IntPtr]::Zero) {
-    Write-Host "No WeChat window (maybe already logged in, OK)"
+    Write-Host "No WeChat window found in ${TimeoutSec}s (already logged in? skip)."
     exit 0
 }
 
-# 3) Read render window rect via Marshal pointer (login window H>W; main W>H)
+# 3) Read render window rect (login window H>W ; main window W>H)
 $ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
 [WxApi]::GetWindowRect($script:render, $ptr) | Out-Null
 $L = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,0)
@@ -95,12 +111,12 @@ Write-Host "Login window detected, clicking Enter-WeChat..."
 [WxApi]::SetForegroundWindow($win) | Out-Null
 Start-Sleep -Milliseconds 300
 
-# 5) Button screen pos (center at 49.8%, 77.3% of render window)
-$x = $L + [int]($w * 0.498)
-$y = $T + [int]($h * 0.773)
+# 5) Button screen pos = relative fraction of render window (resolution / DPI independent)
+$x = $L + [int]($w * $BtnX)
+$y = $T + [int]($h * $BtnY)
 Write-Host "Button at ($x,$y)"
 
-# 6) Real mouse input
+# 6) Real mouse input (the only reliable way for WeChat self-drawn UI)
 [WxApi]::SetCursorPos($x, $y) | Out-Null
 Start-Sleep -Milliseconds 80
 [WxApi]::mouse_event($LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
@@ -108,4 +124,5 @@ Start-Sleep -Milliseconds 40
 [WxApi]::mouse_event($LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
 
 Write-Host "Clicked. Done."
-Start-Sleep -Milliseconds 800
+Start-Sleep -Milliseconds 1000
+# exit quietly
