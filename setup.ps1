@@ -39,24 +39,25 @@ if (-not $wxExe) {
 }
 $wxDir = Split-Path $wxExe
 
-# ---------- 2) Detect screen resolution / DPI ----------
-Add-Type -AssemblyName System.Windows.Forms
-$resW = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width
-$resH = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height
-
+# ---------- 2) Detect physical screen resolution / DPI ----------
+# Use physical pixels (DPI-aware) so the shown resolution is the REAL
+# monitor resolution, not the logical (scaled-down) value.
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class DpiX {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
     [DllImport("user32.dll")] public static extern int GetDpiForSystem();
 }
 "@
-$dpi = 0
-try { $dpi = [DpiX]::GetDpiForSystem() } catch {}
-if ($dpi -eq 0) { $dpi = 96 }
+[DpiX]::SetProcessDPIAware() | Out-Null
+$resW = [DpiX]::GetSystemMetrics(0)   # SM_CXSCREEN physical px
+$resH = [DpiX]::GetSystemMetrics(1)   # SM_CYSCREEN physical px
+$dpi = [DpiX]::GetDpiForSystem()
 $scale = [math]::Round($dpi / 96.0, 2)
 
-Write-Host "Screen resolution : ${resW} x ${resH}"
+Write-Host "Screen resolution : ${resW} x ${resH} (physical)"
 Write-Host "DPI scaling       : $dpi  (${scale}x)"
 Write-Host "WeChat location   : $wxExe"
 
