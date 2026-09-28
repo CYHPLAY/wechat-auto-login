@@ -1,23 +1,31 @@
 # ============================================================
-# wechat-auto-login - ONE-CLICK DEPLOY INSTALLER
-# Detects:
-#   1. WeChat install location (process / common paths / registry)
-#   2. Screen resolution + DPI scaling (button pos is RELATIVE,
-#      so it adapts automatically across resolutions)
-# Then writes the auto-login script and configures autostart.
-# Pure ASCII (PowerShell 5.1 parses no-BOM UTF-8 as ANSI).
-# Usage: powershell -ExecutionPolicy Bypass -File setup.ps1
+# 一键部署安装器（setup.ps1）
+# ------------------------------------------------------------
+# 功能：
+#   在一台新电脑上运行一次即可完成全部部署：
+#     1. 自动识别微信安装位置（进程 / 常见目录）
+#     2. 自动识别屏幕物理分辨率 + DPI 缩放（按钮用相对比例，
+#        自动适配任意分辨率，无需手调）
+#     3. 生成自动登录脚本（微信路径已自动填入）
+#     4. 配置开机自启（启动微信 + 隐藏运行自动登录）
+# 用法：
+#   powershell -ExecutionPolicy Bypass -File setup.ps1
+# 编码提示：
+#   本文件含中文注释，请用【UTF-8 带 BOM】编码保存；
+#   PowerShell 5.1 若乱码，请用记事本另存为 UTF-8（带 BOM）。
 # ============================================================
 param(
-    [string]$OutDir = $PSScriptRoot
+    [string]$OutDir = $PSScriptRoot   # 输出目录：生成的脚本写到这里（默认本目录）
 )
 $ErrorActionPreference = 'Stop'
 
-# ---------- 1) Detect WeChat install location ----------
+# ---------- 第 1 步：自动识别微信安装位置 ----------
 function Find-WeChatExe {
+    # 优先：从正在运行的微信进程获取真实路径
     $p = Get-Process -Name "Weixin" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($p -and $p.Path -and (Test-Path $p.Path)) { return $p.Path }
 
+    # 其次：扫描常见安装目录
     $roots = @("$env:ProgramFiles", "${env:ProgramFiles(x86)}",
                "D:\", "C:\Program Files", "$env:LOCALAPPDATA\Programs")
     $names = @("WeChat\Weixin\Weixin.exe", "Tencent\WeChat\Weixin.exe",
@@ -25,23 +33,22 @@ function Find-WeChatExe {
     foreach ($r in $roots) {
         foreach ($n in $names) {
             $c = Join-Path $r $n
-            if (Test-Path $c) { return $c }
+            if (Test-Path $c) { return $c }   # 找到即返回
         }
     }
-    return $null
+    return $null   # 都没找到
 }
 
 $wxExe = Find-WeChatExe
 if (-not $wxExe) {
-    Write-Host "[ERROR] WeChat Weixin.exe was not found automatically."
-    Write-Host "        Install WeChat first, or open this file and set the path."
+    Write-Host "[ERROR] 未自动找到微信 Weixin.exe。"
+    Write-Host "       请先安装微信，或打开本文件手动修改路径。"
     exit 1
 }
-$wxDir = Split-Path $wxExe
+$wxDir = Split-Path $wxExe   # 微信所在目录
 
-# ---------- 2) Detect physical screen resolution / DPI ----------
-# Use physical pixels (DPI-aware) so the shown resolution is the REAL
-# monitor resolution, not the logical (scaled-down) value.
+# ---------- 第 2 步：识别物理分辨率 / DPI ----------
+# 用物理像素（DPI 感知）检测，显示的是显示器真实分辨率（而非缩放后的逻辑值）
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -52,32 +59,28 @@ public class DpiX {
 }
 "@
 [DpiX]::SetProcessDPIAware() | Out-Null
-$resW = [DpiX]::GetSystemMetrics(0)   # SM_CXSCREEN physical px
-$resH = [DpiX]::GetSystemMetrics(1)   # SM_CYSCREEN physical px
-$dpi = [DpiX]::GetDpiForSystem()
-$scale = [math]::Round($dpi / 96.0, 2)
+$resW = [DpiX]::GetSystemMetrics(0)   # 屏幕物理宽度（像素）
+$resH = [DpiX]::GetSystemMetrics(1)   # 屏幕物理高度（像素）
+$dpi = [DpiX]::GetDpiForSystem()      # 系统 DPI（96 为 100%）
+$scale = [math]::Round($dpi / 96.0, 2)   # 缩放倍数
 
 Write-Host "Screen resolution : ${resW} x ${resH} (physical)"
 Write-Host "DPI scaling       : $dpi  (${scale}x)"
 Write-Host "WeChat location   : $wxExe"
 
-# ---------- 3) Write the auto-login script ----------
-# Button click is located by RELATIVE % of the render window,
-# so it works on any resolution / DPI without manual adjustment.
+# ---------- 第 3 步：生成自动登录脚本 ----------
+# 按钮点击使用【相对比例】，因此任何分辨率 / DPI 都能准确命中，无需手调
 $mainContent = @'
 # ============================================================
-# WeChat auto-login script (zero third-party dependency)
-# Flow: start WeChat -> wait for login window -> activate ->
-#       real mouse input click "Enter WeChat" -> main window.
-# Button located by RELATIVE % of render window -> works on
-# any screen resolution and DPI scaling.
+# 微信自动登录脚本（由 setup.ps1 自动生成）
+# 按钮使用窗口内相对比例定位，适配任意分辨率 / DPI。
 # ============================================================
 param(
-    [string]$WeChatExe = "{WECHAT_EXE}",
-    [string]$WeChatDir = "{WECHAT_DIR}",
-    [int]$TimeoutSec  = 30,
-    [double]$BtnX     = 0.498,
-    [double]$BtnY     = 0.773
+    [string]$WeChatExe = "{WECHAT_EXE}",   # 微信路径（部署时自动填入）
+    [string]$WeChatDir = "{WECHAT_DIR}",   # 微信目录（部署时自动填入）
+    [int]$TimeoutSec  = 30,                 # 等待窗口超时（秒）
+    [double]$BtnX     = 0.498,   # "进入WeChat"按钮 X 比例
+    [double]$BtnY     = 0.773    # "进入WeChat"按钮 Y 比例
 )
 $ErrorActionPreference = 'Stop'
 
@@ -106,6 +109,7 @@ $LEFTDOWN = 0x0002
 $LEFTUP   = 0x0004
 $deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
 
+# 启动微信（若未运行）
 if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
     if (-not (Test-Path $WeChatExe)) {
         Write-Host "WeChat not found: $WeChatExe (skip auto-login)"
@@ -115,6 +119,7 @@ if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
     Start-Sleep -Milliseconds 800
 }
 
+# 等待微信窗口（标题 WeChat + 可见 + 含渲染子窗口）
 Write-Host "Waiting for WeChat window..."
 $script:target = [IntPtr]::Zero
 $script:render = [IntPtr]::Zero
@@ -150,6 +155,7 @@ if ($win -eq [IntPtr]::Zero) {
     exit 0
 }
 
+# 读取渲染窗口矩形（指针方式，PS5.1 下 [ref] 会静默失败）
 $ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
 [WxApi]::GetWindowRect($script:render, $ptr) | Out-Null
 $L = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,0)
@@ -169,10 +175,12 @@ Write-Host "Login window detected, clicking Enter-WeChat..."
 [WxApi]::SetForegroundWindow($win) | Out-Null
 Start-Sleep -Milliseconds 300
 
+# 相对比例定位按钮（分辨率 / DPI 无关）
 $x = $L + [int]($w * $BtnX)
 $y = $T + [int]($h * $BtnY)
 Write-Host "Button at ($x,$y)"
 
+# 真实鼠标输入点击
 [WxApi]::SetCursorPos($x, $y) | Out-Null
 Start-Sleep -Milliseconds 80
 [WxApi]::mouse_event($LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
@@ -183,26 +191,30 @@ Write-Host "Clicked. Done."
 Start-Sleep -Milliseconds 1000
 '@
 
+# 把检测到的微信路径写入生成脚本
 $mainContent = $mainContent.Replace('{WECHAT_EXE}', $wxExe)
 $mainContent = $mainContent.Replace('{WECHAT_DIR}', $wxDir)
 
 $mainPath = Join-Path $OutDir "wechat_autologin.ps1"
+# 写入文件（UTF-8 无 BOM；如需中文脚本请另存为 UTF-8 with BOM）
 [System.IO.File]::WriteAllText($mainPath, $mainContent, (New-Object System.Text.UTF8Encoding $false))
 Write-Host "[OK] Wrote: $mainPath"
 
-# ---------- 4) Configure autostart ----------
-$startup = [Environment]::GetFolderPath('Startup')
+# ---------- 第 4 步：配置开机自启 ----------
+$startup = [Environment]::GetFolderPath('Startup')   # 启动文件夹
 $ws = New-Object -ComObject WScript.Shell
 
+# 启动项 1：开机启动微信
 $l1 = $ws.CreateShortcut((Join-Path $startup "WeChat.lnk"))
 $l1.TargetPath  = $wxExe
-$l1.Description = "Start WeChat"
+$l1.Description = "启动微信"
 $l1.Save()
 
+# 启动项 2：开机隐藏运行自动登录脚本
 $l2 = $ws.CreateShortcut((Join-Path $startup "WeChatAutoLogin.lnk"))
 $l2.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $l2.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mainPath`""
-$l2.Description = "WeChat auto-login"
+$l2.Description = "微信自动登录"
 $l2.Save()
 
 Write-Host "[OK] Autostart configured:"
