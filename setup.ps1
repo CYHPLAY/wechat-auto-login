@@ -1,17 +1,19 @@
 ﻿# ============================================================
 # 微信自动登录 - 一键部署脚本（零第三方依赖 / 纯 PowerShell + Win32 API）
 #
-# 用法：右键“使用 PowerShell 运行”，或在 PowerShell 中执行：
+# 用法：右键“使用 PowerShell 运行”，或：
 #   powershell -ExecutionPolicy Bypass -File .\setup.ps1
 #
-# 它会自动完成：
-#   1) 自动识别微信安装位置（先看正在运行的进程，再扫常见目录/注册表）；
-#   2) 自动识别当前屏幕物理分辨率 / DPI（脚本已 DPI 感知，按钮按比例定位）；
-#   3) 生成 wechat_autologin.ps1 到本脚本所在目录（UTF-8 带 BOM，不乱码）；
-#   4) 在“启动”文件夹创建两个开机自启快捷方式：
-#        - WeChat.lnk          开机启动微信
-#        - WeChatAutoLogin.lnk  开机后隐藏运行自动登录脚本
-#   换电脑 / 换分辨率 / 微信装在别的盘，都直接跑本脚本即可，无需手改。
+# 自动完成：
+#   1) 自动识别微信安装位置（进程 → 常见目录 → 其它盘 → 注册表）；
+#   2) 自动识别屏幕物理分辨率 / DPI（脚本已 DPI 感知，按钮按比例定位）；
+#   3) 生成 wechat_autologin.ps1（UTF-8 带 BOM，不乱码）；
+#   4) 只创建“一个”开机自启入口 WeChatAutoLogin.lnk（开机立即运行，无固定
+#      延迟；微信由脚本幂等启动，进程已在就不重复拉起）；
+#   5) 自动清理会导致开机多开的重复来源：
+#        - 启动文件夹里旧的 WeChat.lnk / 微信.lnk 等直接启动微信的快捷方式；
+#        - 注册表 HKCU\...\Run 里微信自带的开机自启（Weixin / WeChat）。
+#      这样开机只有脚本一个入口，绝不会弹出多个微信。
 # ============================================================
 
 [CmdletBinding()]
@@ -28,12 +30,10 @@ function Write-Warn2($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
 
 # ---------- 1. 识别微信路径 ----------
 function Find-WeChatExe {
-    # 1) 正在运行的微信进程（新版 Weixin / 旧版 WeChat）
     foreach($name in @('Weixin','WeChat')){
         $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
         if($p -and $p.Path -and (Test-Path $p.Path)){ return $p.Path }
     }
-    # 2) 常见安装目录
     $candidates = @(
         "$env:ProgramFiles\Tencent\Weixin\Weixin.exe",
         "${env:ProgramFiles(x86)}\Tencent\Weixin\Weixin.exe",
@@ -49,14 +49,12 @@ function Find-WeChatExe {
         "D:\Program Files (x86)\Tencent\WeChat\WeChat.exe"
     )
     foreach($c in $candidates){ if($c -and (Test-Path $c)){ return $c } }
-    # 3) 其它盘/目录兜底搜索（限定两层常见目录，避免全盘扫描太慢）
     foreach($drive in (Get-PSDrive -PSProvider FileSystem).Root){
         foreach($sub in @('WeChat\Weixin','WeChat','Program Files\Tencent\Weixin','Program Files (x86)\Tencent\Weixin')){
             $guess = Join-Path $drive ($sub + '\Weixin.exe')
             if(Test-Path $guess){ return $guess }
         }
     }
-    # 4) 注册表卸载信息
     foreach($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
                       'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')){
@@ -85,7 +83,7 @@ if(-not $WeChatExe -or -not (Test-Path $WeChatExe)){
 $WeChatDir = Split-Path $WeChatExe -Parent
 Write-Ok "微信路径：$WeChatExe"
 
-# ---------- 2. 识别物理分辨率 / DPI（仅展示，脚本运行时会自行 DPI 感知） ----------
+# ---------- 2. 识别物理分辨率 / DPI（仅展示） ----------
 try{
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type @"
@@ -111,39 +109,38 @@ public class Dpi{
 if(-not $SetupDir -or -not (Test-Path $SetupDir)){ $SetupDir = $PSScriptRoot }
 $outScript = Join-Path $SetupDir "wechat_autologin.ps1"
 
-# 内嵌主脚本（单引号 here-string，原样写入；末尾再替换路径占位符）
 $embedded = @'
 # ============================================================
 # 微信 PC 自动登录脚本（零第三方依赖 / 纯 Windows API）
 # 由 setup.ps1 自动生成。
-# 作用：开机自启微信后，自动点击绿色“进入WeChat”按钮进入主界面。
+# 作用：开机后由唯一的自启快捷方式调用，自动启动微信并点击绿色
+#       “进入WeChat”按钮进入主界面。
 #
-# 核心流程：
-#   1) 启动（或唤起）微信；
-#   2) 按“微信进程 + 渲染子窗(MMUIRenderSubWindowHW)”定位竖版登录窗
-#      —— 不依赖窗口标题语言（中文“微信”/英文“WeChat”都能识别）；
-#   3) 【检测之后再点击】只读按钮区域的像素颜色（GetPixel 单点取色，
-#      不截图、不保存图片、不做图像匹配），确认绿色按钮已真正渲染就绪；
-#   4) 按钮变绿后，把鼠标移到按钮上点一下；检测阶段不移动鼠标、不空点；
-#   5) 检测到渲染窗变成横版主界面即成功，并把鼠标移回原位。
-#
-# 说明：微信界面为自绘 UI，系统里没有标准按钮句柄、也查不到按钮的
-#       “可点”状态；绿色按钮出现是它完成本地/网络初始化、可以点击的
-#       最直接信号，所以用“取色检测到绿”作为点击前提。
-# 兼容：不同分辨率 / DPI / 微信安装位置，按钮位置按窗口比例计算。
+# 设计要点（避免开机多开 / 提速）：
+#   * 幂等启动：微信进程已存在（正在开机初始化）就只等待、绝不重复拉起；
+#               只有进程不存在时才启动一次。
+#   * 唤起节流：进程在但无可见窗口时，先宽限一段时间，之后每隔较长时间
+#               才唤起一次，避免和微信自带开机启动叠加而多开。
+#   * 无固定睡眠：开机即运行，登录窗 / 绿色按钮一就绪就动作，不干等。
+#   * 检测之后再点击：GetPixel 读取按钮区域像素颜色，确认绿色按钮已渲染
+#               就绪才点击（不截图、不存图、不做图像匹配），通常 1 次命中。
 # ============================================================
 
 [CmdletBinding()]
 param(
     [string]$WeChatExe  = "{WECHAT_EXE}",
     [string]$WeChatDir  = "{WECHAT_DIR}",
-    [int]$TimeoutSec    = 30,
+    [int]$WindowTimeoutSec  = 30,
+    [int]$ButtonTimeoutSec  = 60,
     [double]$BtnX       = 0.498,
     [double]$BtnY       = 0.773,
     [double]$GreenRatio = 0.30,
     [int]$MaxRetries    = 5,
     [int]$MinReadyMs    = 250,
-    [bool]$RestoreMouse = $true
+    [int]$ReviveGraceSec   = 12,
+    [int]$ReviveIntervalSec = 8,
+    [bool]$RestoreMouse = $true,
+    [switch]$DontLaunch
 )
 
 $ErrorActionPreference = "Stop"
@@ -344,14 +341,22 @@ function Start-WeChat {
 }
 
 $scriptStart = Get-Date
-Log "launch / activate WeChat..."
-Start-WeChat
 
-$deadline = (Get-Date).AddSeconds($TimeoutSec)
+if ((Get-WeChatPids).Count -gt 0) {
+    Log "WeChat already running; wait for its login window (will NOT launch again)."
+} elseif ($DontLaunch) {
+    Log "No WeChat process; -DontLaunch set, waiting for an external launch..."
+} else {
+    Log "No WeChat process; launching WeChat once..."
+    Start-WeChat
+}
+
+$winDeadline = (Get-Date).AddSeconds($WindowTimeoutSec)
 $lastRect = $null; $stableCount = 0; $firstSeen = $null
-$loginFound = $false; $appearAt = Get-Date
+$loginFound = $false
+$nextReviveAt = (Get-Date).AddSeconds($ReviveGraceSec)
 
-while ((Get-Date) -lt $deadline) {
+while ((Get-Date) -lt $winDeadline) {
     Update-WxWindow
     if ($script:curRender -ne [IntPtr]::Zero) {
         if (-not $firstSeen) { $firstSeen = Get-Date }
@@ -364,19 +369,23 @@ while ((Get-Date) -lt $deadline) {
             $loginFound = $true; break
         }
     } else {
-        if (((Get-Date) - $appearAt).TotalSeconds -ge 5) {
-            Log "no visible window, re-activating..."
-            Start-WeChat; $appearAt = Get-Date
+        if (Test-LoggedIn) { Log "already logged in. Done."; exit 0 }
+        if ((Get-Date) -ge $nextReviveAt) {
+            if (-not $DontLaunch) {
+                if ((Get-WeChatPids).Count -eq 0) { Log "process missing, launching once..." }
+                else { Log "no visible window, reviving once (throttled)..." }
+                Start-WeChat
+            }
+            $nextReviveAt = (Get-Date).AddSeconds($ReviveIntervalSec)
         }
     }
-    Start-Sleep -Milliseconds 60
+    Start-Sleep -Milliseconds 150
 }
 
 if (-not $loginFound) {
     if (Test-LoggedIn) { Log "already logged in. Done."; exit 0 }
-    Log "WARN: $TimeoutSec 秒内未找到微信登录窗。"; exit 1
+    Log "WARN: $WindowTimeoutSec 秒内未找到微信登录窗。"; exit 1
 }
-
 Log ("login window ready after {0} ms" -f [int]($firstSeen - $scriptStart).TotalMilliseconds)
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -385,7 +394,7 @@ $startPos = [System.Windows.Forms.Cursor]::Position
 $ok = $false
 for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
     $diag = $null; $ready = $false
-    $btnDeadline = (Get-Date).AddSeconds($TimeoutSec)
+    $btnDeadline = (Get-Date).AddSeconds($ButtonTimeoutSec)
     while ((Get-Date) -lt $btnDeadline) {
         Update-WxWindow
         if ($script:curRender -eq [IntPtr]::Zero) { $ok = $true; break }
@@ -396,7 +405,7 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         Start-Sleep -Milliseconds 120
     }
     if ($ok) { break }
-    if (-not $ready) { Log "WARN: $TimeoutSec 秒内未检测到绿色登录按钮（按钮未就绪）。"; break }
+    if (-not $ready) { Log "WARN: $ButtonTimeoutSec 秒内未检测到绿色登录按钮（按钮未就绪）。"; break }
     Log ("green login button READY (green ratio {0:P0}, center RGB {1},{2},{3})" -f $diag.Ratio, $diag.CenterR, $diag.CenterG, $diag.CenterB)
 
     Bring-ToFront $script:curTarget
@@ -428,36 +437,44 @@ if ($ok) { Log "Logged in. Done."; exit 0 }
 else { Log "WARN: 自动登录未完成，请手动点击登录。"; exit 1 }
 '@
 
-# 替换路径占位符，并以 UTF-8 带 BOM 写出（保证 PS5.1 中文不乱码）
+# 替换路径占位符，UTF-8 带 BOM 写出
 $embedded = $embedded.Replace("{WECHAT_EXE}", $WeChatExe).Replace("{WECHAT_DIR}", $WeChatDir)
 $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 [System.IO.File]::WriteAllText($outScript, $embedded, $utf8Bom)
 Write-Ok "已生成主脚本：$outScript"
 
-# ---------- 4. 创建开机自启快捷方式 ----------
+# ---------- 4. 清理重复开机启动源，只保留一个入口 ----------
 $startup = [Environment]::GetFolderPath('Startup')
 $wsh = New-Object -ComObject WScript.Shell
 
-# 4.1 微信本体开机启动
-$lnkWeChat = Join-Path $startup "WeChat.lnk"
-$s1 = $wsh.CreateShortcut($lnkWeChat)
-$s1.TargetPath = $WeChatExe
-$s1.WorkingDirectory = $WeChatDir
-$s1.WindowStyle = 1
-$s1.Save()
-Write-Ok "开机启动微信：$lnkWeChat"
+# 4.1 删除启动文件夹里旧的、直接启动微信本体的快捷方式
+foreach($name in @('WeChat.lnk','微信.lnk','Weixin.lnk','微信自动登录.lnk')){
+    $old = Join-Path $startup $name
+    if(Test-Path $old){ Remove-Item $old -Force; Write-Warn2 "删除重复启动项：$name" }
+}
 
-# 4.2 自动登录脚本开机隐藏运行（延迟 8 秒，等微信和网络起来）
+# 4.2 移除注册表中微信自带的开机自启（HKCU\...\Run 的 Weixin / WeChat）
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+foreach($v in @('Weixin','WeChat')){
+    if($null -ne (Get-ItemProperty -Path $runKey -Name $v -ErrorAction SilentlyContinue)){
+        Remove-ItemProperty -Path $runKey -Name $v -ErrorAction SilentlyContinue
+        Write-Warn2 "移除注册表开机自启项：$v"
+    }
+}
+
+# 4.3 只创建一个自启项：开机立即隐藏运行脚本（无固定延迟，脚本内部智能等待/启动微信）
 $lnkAuto = Join-Path $startup "WeChatAutoLogin.lnk"
-$s2 = $wsh.CreateShortcut($lnkAuto)
-$s2.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-$s2.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"Start-Sleep -Seconds 8; & '$outScript'`""
-$s2.WorkingDirectory = $SetupDir
-$s2.WindowStyle = 7
-$s2.Save()
-Write-Ok "开机自动登录：$lnkAuto"
+$s = $wsh.CreateShortcut($lnkAuto)
+$s.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+$s.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$outScript`""
+$s.WorkingDirectory = $SetupDir
+$s.WindowStyle = 7
+$s.Description = "WeChat auto login (single entry)"
+$s.Save()
+Write-Ok "唯一开机自启入口：$lnkAuto"
 
 Write-Host ""
-Write-Ok "部署完成！下次开机会自动启动微信并登录。"
+Write-Ok "部署完成！开机只会启动一个微信并自动登录（脚本幂等启动，不再多开）。"
 Write-Host "    立即测试：powershell -ExecutionPolicy Bypass -File `"$outScript`"" -ForegroundColor Gray
 Write-Host "    卸载自启：运行 uninstall.ps1" -ForegroundColor Gray
+Write-Host "    说明：已关闭微信自带/旧的重复开机启动；如需恢复，在微信“设置-通用设置”里重新勾选开机自动启动即可。" -ForegroundColor Gray

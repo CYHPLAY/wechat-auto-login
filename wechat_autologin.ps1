@@ -1,38 +1,38 @@
 ﻿# ============================================================
 # 微信 PC 自动登录脚本（零第三方依赖 / 纯 Windows API）
-# 作用：开机自启微信后，自动点击绿色“进入WeChat”按钮进入主界面。
+# 由 setup.ps1 自动生成。
+# 作用：开机后由唯一的自启快捷方式调用，自动启动微信并点击绿色
+#       “进入WeChat”按钮进入主界面。
 #
-# 核心流程：
-#   1) 启动（或唤起）微信；
-#   2) 按“微信进程 + 渲染子窗(MMUIRenderSubWindowHW)”定位竖版登录窗
-#      —— 不依赖窗口标题语言（中文“微信”/英文“WeChat”都能识别）；
-#   3) 【检测之后再点击】只读按钮区域的像素颜色（GetPixel 单点取色，
-#      不截图、不保存图片、不做图像匹配），确认绿色按钮已真正渲染就绪；
-#   4) 按钮变绿后，把鼠标移到按钮上点一下；检测阶段不移动鼠标、不空点；
-#   5) 检测到渲染窗变成横版主界面即成功，并把鼠标移回原位。
-#
-# 说明：微信界面为自绘 UI，系统里没有标准按钮句柄、也查不到按钮的
-#       “可点”状态；绿色按钮出现是它完成本地/网络初始化、可以点击的
-#       最直接信号，所以用“取色检测到绿”作为点击前提。
-# 兼容：不同分辨率 / DPI / 微信安装位置，按钮位置按窗口比例计算。
+# 设计要点（避免开机多开 / 提速）：
+#   * 幂等启动：微信进程已存在（正在开机初始化）就只等待、绝不重复拉起；
+#               只有进程不存在时才启动一次。
+#   * 唤起节流：进程在但无可见窗口时，先宽限一段时间，之后每隔较长时间
+#               才唤起一次，避免和微信自带开机启动叠加而多开。
+#   * 无固定睡眠：开机即运行，登录窗 / 绿色按钮一就绪就动作，不干等。
+#   * 检测之后再点击：GetPixel 读取按钮区域像素颜色，确认绿色按钮已渲染
+#               就绪才点击（不截图、不存图、不做图像匹配），通常 1 次命中。
 # ============================================================
 
 [CmdletBinding()]
 param(
-    [string]$WeChatExe  = "D:\WeChat\Weixin\Weixin.exe",   # 微信程序路径
-    [string]$WeChatDir  = "D:\WeChat\Weixin",              # 微信工作目录
-    [int]$TimeoutSec    = 30,                              # 等待登录窗/按钮的总超时（秒）
-    [double]$BtnX       = 0.498,                           # 按钮中心在渲染窗宽度上的比例
-    [double]$BtnY       = 0.773,                           # 按钮中心在渲染窗高度上的比例
-    [double]$GreenRatio = 0.30,                            # 采样点中绿色像素达到该比例即判定按钮就绪
-    [int]$MaxRetries    = 5,                               # 检测到绿并点击后，若没进入的最多补点次数
-    [int]$MinReadyMs    = 250,                             # 登录窗矩形稳定后至少等多久再开始取色（毫秒）
-    [bool]$RestoreMouse = $true                            # 登录完成后是否把鼠标移回原位
+    [string]$WeChatExe  = "D:\WeChat\Weixin\Weixin.exe",
+    [string]$WeChatDir  = "D:\WeChat\Weixin",
+    [int]$WindowTimeoutSec  = 30,
+    [int]$ButtonTimeoutSec  = 60,
+    [double]$BtnX       = 0.498,
+    [double]$BtnY       = 0.773,
+    [double]$GreenRatio = 0.30,
+    [int]$MaxRetries    = 5,
+    [int]$MinReadyMs    = 250,
+    [int]$ReviveGraceSec   = 12,
+    [int]$ReviveIntervalSec = 8,
+    [bool]$RestoreMouse = $true,
+    [switch]$DontLaunch
 )
 
 $ErrorActionPreference = "Stop"
 
-# ---------- Win32 API ----------
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -55,7 +55,7 @@ public class WxApi {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr ignore);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);   // 传 IntPtr.Zero 取整个屏幕 DC
+    [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
     [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr hdc, int nXPos, int nYPos);
 }
@@ -63,25 +63,19 @@ public class WxApi {
 
 [WxApi]::SetProcessDPIAware() | Out-Null
 
-# 鼠标事件常量
 $MOUSEEVENTF_MOVE     = 0x0001
 $MOUSEEVENTF_LEFTDOWN = 0x0002
 $MOUSEEVENTF_LEFTUP   = 0x0004
 $SW_RESTORE           = 9
 
-function Log($msg) {
-    $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $msg
-    Write-Host $line
-}
+function Log($msg) { Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $msg) }
 
-# 取微信相关进程 PID（新版进程名为 Weixin，兼容旧版 WeChat）
 function Get-WeChatPids {
     @(Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ProcessName -match '^(Weixin|WeChat)$' } |
         Select-Object -ExpandProperty Id)
 }
 
-# 用 AllocHGlobal 方式取窗口矩形（PS 5.1 下用 [ref] 接 RECT 会静默返回全 0）
 function Get-WxRect([IntPtr]$hwnd) {
     $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
     try {
@@ -95,12 +89,9 @@ function Get-WxRect([IntPtr]$hwnd) {
     finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }
 }
 
-# 全局：当前竖版登录窗及其渲染子窗（每次扫描刷新）
 $script:curTarget = [IntPtr]::Zero
 $script:curRender = [IntPtr]::Zero
 
-# 枚举属于微信进程、可见、且含 MMUIRenderSubWindowHW 渲染子窗的顶层窗；
-# 只取竖版（高>宽），即登录窗；横版主界面在 Test-LoggedIn 单独判断。
 function Update-WxWindow {
     $script:curTarget = [IntPtr]::Zero
     $script:curRender = [IntPtr]::Zero
@@ -114,7 +105,6 @@ function Update-WxWindow {
         [void][WxApi]::GetWindowThreadProcessId($top, [ref]$procId)
         if ($pids -notcontains [int]$procId) { return $true }
 
-        $render = [IntPtr]::Zero
         $enumChild = [WxApi+EnumWindowsProc]{
             param($child, $lp2)
             $sb = New-Object System.Text.StringBuilder 256
@@ -140,11 +130,9 @@ function Update-WxWindow {
     [void][WxApi]::EnumWindows($enumTop, [IntPtr]::Zero)
 }
 
-# 是否已经进入横版主界面（存在属于微信进程的横版渲染窗，宽>=高）
 function Test-LoggedIn {
     $pids = Get-WeChatPids
     if ($pids.Count -eq 0) { return $false }
-    $hit = $false
     $enumTop = [WxApi+EnumWindowsProc]{
         param($top, $lp)
         if (-not [WxApi]::IsWindowVisible($top)) { return $true }
@@ -171,29 +159,19 @@ function Test-LoggedIn {
     return [bool]$script:hit
 }
 
-# 判断一个 RGB 是否为“微信绿”（绿色分量明显高于红/蓝，容忍版本色差）
 function Test-GreenPixel([int]$cr,[int]$cg,[int]$cb) {
     return ($cg -ge 110 -and ($cg - $cr) -ge 35 -and ($cg - $cb) -ge 35)
 }
 
-# 【就绪检测】在按钮区域取一小簇像素（9x3），统计绿色占比。
-# 只 GetPixel 读颜色，不移动鼠标、不截图、不保存图片。
-# 用 [ref]$Info 回传诊断信息（绿色比例、中心点坐标/颜色）。
 function Test-ButtonReady([ref]$Info) {
-    if ($script:curRender -eq [IntPtr]::Zero) {
-        if ($Info) { $Info.Value = $null }
-        return $false
-    }
+    if ($script:curRender -eq [IntPtr]::Zero) { if ($Info) { $Info.Value = $null }; return $false }
     $r = Get-WxRect $script:curRender
-    if ($r.W -ge $r.H) {          # 已横版=主界面，无需再点
-        if ($Info) { $Info.Value = $null }
-        return $false
-    }
+    if ($r.W -ge $r.H) { if ($Info) { $Info.Value = $null }; return $false }
 
     $cx = $r.L + [int]($r.W * $BtnX)
     $cy = $r.T + [int]($r.H * $BtnY)
-    $rx = [int]($r.W * 0.13)      # 采样半宽（落在按钮内部，避开按钮外区域）
-    $ry = [int]($r.H * 0.016)     # 采样半高（避开按钮外区域）
+    $rx = [int]($r.W * 0.13)
+    $ry = [int]($r.H * 0.016)
 
     $hdc = [WxApi]::GetDC([IntPtr]::Zero)
     try {
@@ -226,7 +204,6 @@ function Test-ButtonReady([ref]$Info) {
     return ($ratio -ge $GreenRatio)
 }
 
-# 强制把窗口拉到前台（自绘界面的真实点击需要窗口在前台）
 function Bring-ToFront([IntPtr]$hwnd) {
     if ($hwnd -eq [IntPtr]::Zero) { return }
     [void][WxApi]::ShowWindow($hwnd, $SW_RESTORE)
@@ -243,30 +220,31 @@ function Bring-ToFront([IntPtr]$hwnd) {
     [void][WxApi]::AttachThreadInput($curThread, $fgThread, $false)
 }
 
-# 唤起微信（无可见登录窗时调用；微信是单实例，重复启动只会唤起原实例不会多开）
 function Start-WeChat {
     if (Test-Path $WeChatExe) {
         Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
-    }
-    else {
-        Log "WARN: 未找到微信程序 $WeChatExe"
+    } else {
+        Write-Host ("[{0}] WARN: 未找到微信程序 {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $WeChatExe)
     }
 }
 
-# ====================== 主流程 ======================
 $scriptStart = Get-Date
-Log "launch / activate WeChat..."
-Start-WeChat
 
-# 1) 等待竖版登录窗出现，并要求矩形连续 3 次稳定 + 至少就绪 MinReadyMs
-$deadline = (Get-Date).AddSeconds($TimeoutSec)
-$lastRect = $null
-$stableCount = 0
-$firstSeen = $null
+if ((Get-WeChatPids).Count -gt 0) {
+    Log "WeChat already running; wait for its login window (will NOT launch again)."
+} elseif ($DontLaunch) {
+    Log "No WeChat process; -DontLaunch set, waiting for an external launch..."
+} else {
+    Log "No WeChat process; launching WeChat once..."
+    Start-WeChat
+}
+
+$winDeadline = (Get-Date).AddSeconds($WindowTimeoutSec)
+$lastRect = $null; $stableCount = 0; $firstSeen = $null
 $loginFound = $false
-$appearAt = Get-Date
+$nextReviveAt = (Get-Date).AddSeconds($ReviveGraceSec)
 
-while ((Get-Date) -lt $deadline) {
+while ((Get-Date) -lt $winDeadline) {
     Update-WxWindow
     if ($script:curRender -ne [IntPtr]::Zero) {
         if (-not $firstSeen) { $firstSeen = Get-Date }
@@ -276,58 +254,48 @@ while ((Get-Date) -lt $deadline) {
         } else { $stableCount = 0 }
         $lastRect = $r
         if ($stableCount -ge 2 -and ((Get-Date) - $firstSeen).TotalMilliseconds -ge $MinReadyMs) {
-            $loginFound = $true
-            break
+            $loginFound = $true; break
         }
     } else {
-        # 进程在但没有可见窗口（关窗后驻留托盘）：周期性重新唤起
-        if (((Get-Date) - $appearAt).TotalSeconds -ge 5) {
-            Log "no visible window, re-activating..."
-            Start-WeChat
-            $appearAt = Get-Date
+        if (Test-LoggedIn) { Log "already logged in. Done."; exit 0 }
+        if ((Get-Date) -ge $nextReviveAt) {
+            if (-not $DontLaunch) {
+                if ((Get-WeChatPids).Count -eq 0) { Log "process missing, launching once..." }
+                else { Log "no visible window, reviving once (throttled)..." }
+                Start-WeChat
+            }
+            $nextReviveAt = (Get-Date).AddSeconds($ReviveIntervalSec)
         }
     }
-    Start-Sleep -Milliseconds 60
+    Start-Sleep -Milliseconds 150
 }
 
 if (-not $loginFound) {
-    if (Test-LoggedIn) {
-        Log "already logged in. Done."
-        exit 0
-    }
-    Log "WARN: $TimeoutSec 秒内未找到微信登录窗。"
-    exit 1
+    if (Test-LoggedIn) { Log "already logged in. Done."; exit 0 }
+    Log "WARN: $WindowTimeoutSec 秒内未找到微信登录窗。"; exit 1
 }
-
 Log ("login window ready after {0} ms" -f [int]($firstSeen - $scriptStart).TotalMilliseconds)
 
-# 记录当前鼠标位置，结束后归位
 Add-Type -AssemblyName System.Windows.Forms
 $startPos = [System.Windows.Forms.Cursor]::Position
 
 $ok = $false
 for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-    # 2) 【检测】轮询取色，等绿色按钮真正渲染就绪（这段时间鼠标完全不动、不点击）
     $diag = $null; $ready = $false
-    $btnDeadline = (Get-Date).AddSeconds($TimeoutSec)
+    $btnDeadline = (Get-Date).AddSeconds($ButtonTimeoutSec)
     while ((Get-Date) -lt $btnDeadline) {
         Update-WxWindow
-        if ($script:curRender -eq [IntPtr]::Zero) { $ok = $true; break }   # 登录窗消失=已进入
+        if ($script:curRender -eq [IntPtr]::Zero) { $ok = $true; break }
         $rr = Get-WxRect $script:curRender
-        if ($rr.W -ge $rr.H) { $ok = $true; break }                        # 已横版=主界面
+        if ($rr.W -ge $rr.H) { $ok = $true; break }
         $d = $null
         if (Test-ButtonReady ([ref]$d)) { $ready = $true; $diag = $d; break }
         Start-Sleep -Milliseconds 120
     }
     if ($ok) { break }
-    if (-not $ready) {
-        Log "WARN: $TimeoutSec 秒内未检测到绿色登录按钮（按钮未就绪）。"
-        break
-    }
-    Log ("green login button READY (green ratio {0:P0}, center RGB {1},{2},{3})" -f `
-        $diag.Ratio, $diag.CenterR, $diag.CenterG, $diag.CenterB)
+    if (-not $ready) { Log "WARN: $ButtonTimeoutSec 秒内未检测到绿色登录按钮（按钮未就绪）。"; break }
+    Log ("green login button READY (green ratio {0:P0}, center RGB {1},{2},{3})" -f $diag.Ratio, $diag.CenterR, $diag.CenterG, $diag.CenterB)
 
-    # 3) 【点击】按钮已就绪，置前后点一下
     Bring-ToFront $script:curTarget
     Start-Sleep -Milliseconds 120
     $r = Get-WxRect $script:curRender
@@ -336,13 +304,12 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
     Log ("Click attempt {0}/{1} at ({2},{3}) size {4}x{5}" -f $attempt,$MaxRetries,$x,$y,$r.W,$r.H)
 
     [WxApi]::SetCursorPos($x,$y) | Out-Null
-    [WxApi]::mouse_event($MOUSEEVENTF_MOVE,0,0,0,[UIntPtr]::Zero)   # 产生一次 hover
+    [WxApi]::mouse_event($MOUSEEVENTF_MOVE,0,0,0,[UIntPtr]::Zero)
     Start-Sleep -Milliseconds 60
     [WxApi]::mouse_event($MOUSEEVENTF_LEFTDOWN,0,0,0,[UIntPtr]::Zero)
     Start-Sleep -Milliseconds 18
     [WxApi]::mouse_event($MOUSEEVENTF_LEFTUP,0,0,0,[UIntPtr]::Zero)
 
-    # 4) 等待进入横版主界面（最多 4 秒）；进入即成功，否则回到上面重新检测再点
     $inDeadline = (Get-Date).AddSeconds(4)
     while ((Get-Date) -lt $inDeadline) {
         Start-Sleep -Milliseconds 100
@@ -352,15 +319,7 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
     Log "clicked but main UI not shown yet, re-detecting..."
 }
 
-# 鼠标归位
-if ($RestoreMouse) {
-    [WxApi]::SetCursorPos($startPos.X, $startPos.Y) | Out-Null
-}
+if ($RestoreMouse) { [WxApi]::SetCursorPos($startPos.X, $startPos.Y) | Out-Null }
 
-if ($ok) {
-    Log "Logged in. Done."
-    exit 0
-} else {
-    Log "WARN: 自动登录未完成，请手动点击登录。"
-    exit 1
-}
+if ($ok) { Log "Logged in. Done."; exit 0 }
+else { Log "WARN: 自动登录未完成，请手动点击登录。"; exit 1 }
