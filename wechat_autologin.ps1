@@ -1,34 +1,32 @@
-# ============================================================
-# 微信自动登录脚本（wechat_autologin.ps1）
+﻿# ============================================================
+# 微信自动登录脚本（wechat_autologin.ps1）—— 改进版
 # ------------------------------------------------------------
-# 功能：
-#   开机/手动运行后，自动完成以下流程：
-#     1. 启动微信（若未运行）
-#     2. 轮询等待微信登录窗口出现
-#     3. 激活登录窗口
-#     4. 用【相对比例】定位"进入WeChat"按钮
-#     5. 真实鼠标输入点击（SetCursorPos + mouse_event）
-#     6. 进入主界面后静默退出
+# 功能流程：
+#   1. 启动微信（若未运行）
+#   2. 快速轮询等待微信【登录窗口】出现（事件驱动，不做固定长等待）
+#   3. 记住当前鼠标位置
+#   4. 激活窗口，用【相对比例】定位"进入WeChat"并真实鼠标点击
+#   5. 点击后轮询校验是否进入主界面（竖版登录窗 -> 横版主界面）
+#      未进入则自动重新点击，最多 MaxRetries 次
+#   6. 登录完成后把鼠标【移回原位】，减少对操作的打扰
 # 特性：
-#   - 按钮使用窗口内相对比例定位（默认 49.8%、77.3%），
-#     因此在不同分辨率、不同 DPI 缩放的屏幕上都能准确点击。
-#   - 零第三方依赖：仅用 Windows 自带 PowerShell + user32 API。
-# 运行方式：
+#   - 更快：窗口一出现就点、确认进入主界面立即退出
+#   - 按钮用窗口内相对比例定位，适配任意分辨率 / DPI
+#   - 零第三方依赖：仅 PowerShell + Windows user32 API
+# 运行：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File wechat_autologin.ps1
-#   可选参数：-WeChatExe "微信路径" -BtnX 0.498 -BtnY 0.773
-# 编码提示：
-#   本文件含中文注释，请用【UTF-8 带 BOM】编码保存；
-#   若 PowerShell 5.1 显示乱码或报错，用记事本"另存为"
-#   选择编码：UTF-8（带 BOM）后重新运行。
+# 编码：本文件含中文注释，请用 UTF-8（带 BOM）保存（setup.ps1 会自动带 BOM 生成）
 # ============================================================
 param(
-    [string]$WeChatExe = "D:\WeChat\Weixin\Weixin.exe",  # 微信程序路径（按实际安装位置修改）
-    [string]$WeChatDir = "D:\WeChat\Weixin",             # 微信工作目录
-    [int]$TimeoutSec  = 30,                                # 等待登录窗口的超时时间（秒）
-    [double]$BtnX     = 0.498,  # "进入WeChat"按钮中心 X：窗口宽度比例（分辨率无关）
-    [double]$BtnY     = 0.773   # "进入WeChat"按钮中心 Y：窗口高度比例（分辨率无关）
+    [string]$WeChatExe   = "D:\WeChat\Weixin\Weixin.exe",  # 微信程序路径
+    [string]$WeChatDir   = "D:\WeChat\Weixin",             # 微信工作目录
+    [int]$TimeoutSec     = 30,    # 等待登录窗口超时（秒）
+    [double]$BtnX        = 0.498, # "进入WeChat"按钮中心 X 比例
+    [double]$BtnY        = 0.773, # "进入WeChat"按钮中心 Y 比例
+    [int]$MaxRetries     = 3,     # 点击失败时的最大尝试次数
+    [bool]$RestoreMouse  = $true  # 登录完成后是否把鼠标移回原位
 )
-$ErrorActionPreference = 'Stop'   # 出错立即停止，便于排查
+$ErrorActionPreference = 'Stop'
 
 # ---------- 导入 Windows user32 原生 API（零依赖） ----------
 Add-Type @"
@@ -36,111 +34,134 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 public class WxApi {
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();   // 让进程按物理像素工作（DPI 感知）
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);  // 将窗口置为前台
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);  // 枚举所有顶层窗口
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
     public delegate bool EnumProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, ChildProc cb, IntPtr l);  // 枚举子窗口
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, ChildProc cb, IntPtr l);
     public delegate bool ChildProc(IntPtr h, IntPtr l);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);  // 读窗口标题
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);   // 读窗口类名
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, IntPtr rect);  // 读窗口矩形（位置+尺寸）
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);  // 窗口是否可见
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);  // 移动鼠标指针到屏幕坐标
-    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);  // 发送鼠标事件
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, IntPtr rect);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+    public struct POINT { public int X; public int Y; }
 }
 "@
-[WxApi]::SetProcessDPIAware() | Out-Null   # 开启 DPI 感知：后续取到的都是物理像素，保证高 DPI 屏幕下坐标准确
+[WxApi]::SetProcessDPIAware() | Out-Null   # DPI 感知：按物理像素工作
 
-$LEFTDOWN = 0x0002   # 鼠标左键【按下】事件标志
-$LEFTUP   = 0x0004   # 鼠标左键【抬起】事件标志
-$deadline = [DateTime]::Now.AddSeconds($TimeoutSec)   # 超时截止时间
+$LEFTDOWN = 0x0002   # 鼠标左键按下
+$LEFTUP   = 0x0004   # 鼠标左键抬起
 
-# ---------- 第 1 步：若微信未运行，则启动微信 ----------
-if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
-    if (-not (Test-Path $WeChatExe)) {
-        # 微信路径不存在：跳过自动登录（避免报错）
-        Write-Host "WeChat not found: $WeChatExe (skip auto-login)"
-        exit 0
-    }
-    Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir   # 启动微信
-    Start-Sleep -Milliseconds 800   # 等微信进程初始化
-}
+# 带毫秒时间戳的日志
+function Log([string]$msg){ Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $msg) }
 
-# ---------- 第 2 步：轮询等待微信窗口出现 ----------
-# 判断依据：窗口标题为 WeChat、可见、且包含渲染子窗口 MMUIRenderSubWindowHW（微信自绘 UI）
-Write-Host "Waiting for WeChat window..."
-$script:target = [IntPtr]::Zero   # 微信主窗口句柄
-$script:render = [IntPtr]::Zero   # 渲染子窗口句柄（用于定位按钮）
-while ([DateTime]::Now -lt $deadline) {
-    $script:target = [IntPtr]::Zero
-    $script:render = [IntPtr]::Zero
+# 枚举微信窗口，结果写入 $script:curTarget（主窗口）/ $script:curRender（渲染子窗口）
+function Update-WxWindow {
+    $script:curTarget = [IntPtr]::Zero
+    $script:curRender = [IntPtr]::Zero
     $cb = [WxApi+EnumProc]{
         param($h,$l)
         $t = New-Object System.Text.StringBuilder 256
         [WxApi]::GetWindowText($h,$t,256) | Out-Null
-        if ($t.ToString() -ne 'WeChat') { return $true }   # 标题不是 WeChat，跳过
-        if (-not [WxApi]::IsWindowVisible($h)) { return $true }   # 窗口不可见，跳过
+        if ($t.ToString() -ne 'WeChat') { return $true }
+        if (-not [WxApi]::IsWindowVisible($h)) { return $true }
         $script:fr = [IntPtr]::Zero
         $ccb = [WxApi+ChildProc]{
             param($ch,$cl)
             $cn = New-Object System.Text.StringBuilder 256
             [WxApi]::GetClassName($ch,$cn,256) | Out-Null
-            if ($cn.ToString() -eq 'MMUIRenderSubWindowHW') { $script:fr = $ch; return $false }   # 找到渲染子窗口
+            if ($cn.ToString() -eq 'MMUIRenderSubWindowHW') { $script:fr = $ch; return $false }
             return $true
         }
         [WxApi]::EnumChildWindows($h,$ccb,[IntPtr]::Zero) | Out-Null
-        if ($script:fr -ne [IntPtr]::Zero) { $script:target = $h; $script:render = $script:fr; return $false }   # 命中微信窗口
+        if ($script:fr -ne [IntPtr]::Zero) { $script:curTarget = $h; $script:curRender = $script:fr; return $false }
         return $true
     }
     [WxApi]::EnumWindows($cb,[IntPtr]::Zero) | Out-Null
-    if ($script:target -ne [IntPtr]::Zero) { break }   # 已找到，跳出循环
-    Start-Sleep -Milliseconds 250   # 每 250ms 查一次
 }
 
-$win = $script:target
-if ($win -eq [IntPtr]::Zero) {
-    # 超时未找到窗口：说明可能已登录成功，直接退出
-    Write-Host "No WeChat window found in ${TimeoutSec}s (already logged in? skip)."
-    exit 0
+# 读取窗口矩形（指针方式，兼容 PS5.1），返回 坐标 + 宽高
+function Get-WxRect([IntPtr]$hwnd){
+    $p = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+    [WxApi]::GetWindowRect($hwnd,$p) | Out-Null
+    $L = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,0)
+    $T = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,4)
+    $R = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,8)
+    $B = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,12)
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($p)
+    return @{ L=$L; T=$T; R=$R; B=$B; W=($R-$L); H=($B-$T) }
 }
 
-# ---------- 第 3 步：读取渲染窗口矩形 ----------
-# 用指针方式读取 GetWindowRect 返回的 4 个 int（PS5.1 下 [ref] 方式会静默失败，必须用指针）
-$ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
-[WxApi]::GetWindowRect($script:render, $ptr) | Out-Null
-$L = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,0)   # 左
-$T = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,4)   # 上
-$R = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,8)   # 右
-$B = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,12)  # 下
-[System.Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)   # 释放内存
-
-$w = $R - $L   # 窗口宽度（物理像素）
-$h = $B - $T   # 窗口高度（物理像素）
-if ($h -le $w) {
-    # 宽 >= 高：是主界面窗口（横版），无需点击，直接退出
-    Write-Host "Main window detected, no click needed."
-    exit 0
+# 是否已进入主界面：渲染窗不存在，或 宽>=高（横版=主界面；竖版=登录窗）
+function Test-LoggedIn {
+    Update-WxWindow
+    if ($script:curRender -eq [IntPtr]::Zero) { return $true }
+    $r = Get-WxRect $script:curRender
+    return ($r.W -ge $r.H)
 }
-Write-Host "Login window detected, clicking Enter-WeChat..."
 
-# ---------- 第 4 步：激活窗口（置为前台） ----------
-[WxApi]::SetForegroundWindow($win) | Out-Null
-Start-Sleep -Milliseconds 300   # 等待窗口激活完成
+# ---------- 1) 启动微信（若未运行） ----------
+if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path $WeChatExe)) { Log "WeChat not found: $WeChatExe (skip)"; exit 0 }
+    Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
+    Log "WeChat starting..."
+}
 
-# ---------- 第 5 步：用相对比例计算按钮屏幕坐标 ----------
-# 关键：按钮位置 = 窗口左上角 + 窗口尺寸 × 比例，与分辨率/DPI 无关
-$x = $L + [int]($w * $BtnX)
-$y = $T + [int]($h * $BtnY)
-Write-Host "Button at ($x,$y)"
+# ---------- 2) 快速轮询等待【登录窗口】出现 ----------
+$deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
+$loginFound = $false
+while ([DateTime]::Now -lt $deadline) {
+    Update-WxWindow
+    if ($script:curTarget -ne [IntPtr]::Zero) {
+        $r0 = Get-WxRect $script:curRender
+        if ($r0.H -gt $r0.W) { $loginFound = $true; break }   # 竖版 = 登录窗
+        if ($r0.W -ge $r0.H) { Log "Already in main window, nothing to click."; exit 0 }  # 横版 = 已登录
+    }
+    Start-Sleep -Milliseconds 150
+}
+if (-not $loginFound) { Log "No login window within ${TimeoutSec}s (already logged in?). skip."; exit 0 }
 
-# ---------- 第 6 步：真实鼠标输入点击 ----------
-# 微信自绘界面不接受后台消息注入，必须用真实鼠标事件
-[WxApi]::SetCursorPos($x, $y) | Out-Null   # 移动鼠标到按钮
-Start-Sleep -Milliseconds 80
-[WxApi]::mouse_event($LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)   # 按下左键
-Start-Sleep -Milliseconds 40
-[WxApi]::mouse_event($LEFTUP, 0, 0, 0, [UIntPtr]::Zero)     # 抬起左键
+# ---------- 3) 记住当前鼠标位置（用于结束后归位） ----------
+$saved = New-Object 'WxApi+POINT'
+[WxApi]::GetCursorPos([ref]$saved) | Out-Null
 
-Write-Host "Clicked. Done."   # 点击完成
-Start-Sleep -Milliseconds 1000   # 稍等后静默退出
+# ---------- 4) 点击 -> 校验 -> 重试 ----------
+$ok = $false
+for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+    if (Test-LoggedIn) { $ok = $true; break }
+    if ($script:curRender -eq [IntPtr]::Zero) { $ok = $true; break }
+
+    [WxApi]::SetForegroundWindow($script:curTarget) | Out-Null
+    Start-Sleep -Milliseconds 150
+
+    # 激活后重新读取位置/尺寸（窗口可能被移动）
+    $r = Get-WxRect $script:curRender
+    $x = $r.L + [int]($r.W * $BtnX)
+    $y = $r.T + [int]($r.H * $BtnY)
+    Log ("Click attempt {0}/{1} at ({2},{3}) size {4}x{5}" -f $attempt,$MaxRetries,$x,$y,$r.W,$r.H)
+
+    # 真实鼠标输入（微信自绘界面不接受后台消息注入）
+    [WxApi]::SetCursorPos($x,$y) | Out-Null
+    Start-Sleep -Milliseconds 60
+    [WxApi]::mouse_event($LEFTDOWN,0,0,0,[UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 30
+    [WxApi]::mouse_event($LEFTUP,0,0,0,[UIntPtr]::Zero)
+
+    # ---------- 5) 快速轮询确认是否进入主界面（一进入立即返回，最多 2.5s） ----------
+    $clickDeadline = [DateTime]::Now.AddSeconds(2.5)
+    while ([DateTime]::Now -lt $clickDeadline) {
+        Start-Sleep -Milliseconds 120
+        if (Test-LoggedIn) { $ok = $true; break }
+    }
+    if ($ok) { break }
+    Log "Not in main window yet, retrying..."
+}
+
+# ---------- 6) 鼠标归位 ----------
+if ($RestoreMouse) { [WxApi]::SetCursorPos($saved.X,$saved.Y) | Out-Null }
+
+if ($ok) { Log "Logged in. Done."; exit 0 }
+else { Log "WARN: login not confirmed after $MaxRetries attempts, please click manually."; exit 1 }

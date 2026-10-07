@@ -1,27 +1,23 @@
-# ============================================================
-# 一键部署安装器（setup.ps1）
+﻿# ============================================================
+# 一键部署安装器（setup.ps1）—— 改进版
 # ------------------------------------------------------------
-# 功能：
-#   在一台新电脑上运行一次即可完成全部部署：
-#     1. 自动识别微信安装位置（进程 / 常见目录）
-#     2. 自动识别屏幕物理分辨率 + DPI 缩放（按钮用相对比例，
-#        自动适配任意分辨率，无需手调）
-#     3. 生成自动登录脚本（微信路径已自动填入）
-#     4. 配置开机自启（启动微信 + 隐藏运行自动登录）
-# 用法：
-#   powershell -ExecutionPolicy Bypass -File setup.ps1
-# 编码提示：
-#   本文件含中文注释，请用【UTF-8 带 BOM】编码保存；
-#   PowerShell 5.1 若乱码，请用记事本另存为 UTF-8（带 BOM）。
+# 运行一次即可完成全部部署：
+#   1. 自动识别微信安装位置（进程 / 常见目录）
+#   2. 自动识别屏幕物理分辨率 + DPI（按钮用相对比例，自动适配）
+#   3. 生成自动登录脚本（微信路径自动填入，UTF-8 带 BOM，中文注释不乱码）
+#   4. 配置开机自启（启动微信 + 隐藏运行自动登录）
+# 卸载：运行 uninstall.ps1
+# 用法：powershell -ExecutionPolicy Bypass -File setup.ps1
+# 编码：本文件含中文注释，请用 UTF-8（带 BOM）保存。
 # ============================================================
 param(
-    [string]$OutDir = $PSScriptRoot   # 输出目录：生成的脚本写到这里（默认本目录）
+    [string]$OutDir = $PSScriptRoot   # 生成脚本的输出目录（默认本目录）
 )
 $ErrorActionPreference = 'Stop'
 
 # ---------- 第 1 步：自动识别微信安装位置 ----------
 function Find-WeChatExe {
-    # 优先：从正在运行的微信进程获取真实路径
+    # 优先：从正在运行的微信进程取真实路径
     $p = Get-Process -Name "Weixin" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($p -and $p.Path -and (Test-Path $p.Path)) { return $p.Path }
 
@@ -33,22 +29,21 @@ function Find-WeChatExe {
     foreach ($r in $roots) {
         foreach ($n in $names) {
             $c = Join-Path $r $n
-            if (Test-Path $c) { return $c }   # 找到即返回
+            if (Test-Path $c) { return $c }
         }
     }
-    return $null   # 都没找到
+    return $null
 }
 
 $wxExe = Find-WeChatExe
 if (-not $wxExe) {
-    Write-Host "[ERROR] 未自动找到微信 Weixin.exe。"
-    Write-Host "       请先安装微信，或打开本文件手动修改路径。"
+    Write-Host "[ERROR] WeChat Weixin.exe not found automatically."
+    Write-Host "        Please install WeChat first, or edit the path in this file."
     exit 1
 }
-$wxDir = Split-Path $wxExe   # 微信所在目录
+$wxDir = Split-Path $wxExe
 
 # ---------- 第 2 步：识别物理分辨率 / DPI ----------
-# 用物理像素（DPI 感知）检测，显示的是显示器真实分辨率（而非缩放后的逻辑值）
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -59,28 +54,28 @@ public class DpiX {
 }
 "@
 [DpiX]::SetProcessDPIAware() | Out-Null
-$resW = [DpiX]::GetSystemMetrics(0)   # 屏幕物理宽度（像素）
-$resH = [DpiX]::GetSystemMetrics(1)   # 屏幕物理高度（像素）
-$dpi = [DpiX]::GetDpiForSystem()      # 系统 DPI（96 为 100%）
-$scale = [math]::Round($dpi / 96.0, 2)   # 缩放倍数
-
+$resW  = [DpiX]::GetSystemMetrics(0)
+$resH  = [DpiX]::GetSystemMetrics(1)
+$dpi   = [DpiX]::GetDpiForSystem()
+$scale = [math]::Round($dpi / 96.0, 2)
 Write-Host "Screen resolution : ${resW} x ${resH} (physical)"
 Write-Host "DPI scaling       : $dpi  (${scale}x)"
 Write-Host "WeChat location   : $wxExe"
 
-# ---------- 第 3 步：生成自动登录脚本 ----------
-# 按钮点击使用【相对比例】，因此任何分辨率 / DPI 都能准确命中，无需手调
+# ---------- 第 3 步：生成自动登录脚本（内嵌改进版，路径用占位符） ----------
 $mainContent = @'
 # ============================================================
-# 微信自动登录脚本（由 setup.ps1 自动生成）
-# 按钮使用窗口内相对比例定位，适配任意分辨率 / DPI。
+# 微信自动登录脚本（由 setup.ps1 自动生成，UTF-8 带 BOM）
+# 改进点：事件驱动更快、点击失败自动重试、登录后鼠标归位。
 # ============================================================
 param(
-    [string]$WeChatExe = "{WECHAT_EXE}",   # 微信路径（部署时自动填入）
-    [string]$WeChatDir = "{WECHAT_DIR}",   # 微信目录（部署时自动填入）
-    [int]$TimeoutSec  = 30,                 # 等待窗口超时（秒）
-    [double]$BtnX     = 0.498,   # "进入WeChat"按钮 X 比例
-    [double]$BtnY     = 0.773    # "进入WeChat"按钮 Y 比例
+    [string]$WeChatExe  = "{WECHAT_EXE}",
+    [string]$WeChatDir  = "{WECHAT_DIR}",
+    [int]$TimeoutSec    = 30,
+    [double]$BtnX       = 0.498,
+    [double]$BtnY       = 0.773,
+    [int]$MaxRetries    = 3,
+    [bool]$RestoreMouse = $true
 )
 $ErrorActionPreference = 'Stop'
 
@@ -100,32 +95,21 @@ public class WxApi {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, IntPtr rect);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+    public struct POINT { public int X; public int Y; }
 }
 "@
 [WxApi]::SetProcessDPIAware() | Out-Null
 
 $LEFTDOWN = 0x0002
 $LEFTUP   = 0x0004
-$deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
 
-# 启动微信（若未运行）
-if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
-    if (-not (Test-Path $WeChatExe)) {
-        Write-Host "WeChat not found: $WeChatExe (skip auto-login)"
-        exit 0
-    }
-    Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
-    Start-Sleep -Milliseconds 800
-}
+function Log([string]$msg){ Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $msg) }
 
-# 等待微信窗口（标题 WeChat + 可见 + 含渲染子窗口）
-Write-Host "Waiting for WeChat window..."
-$script:target = [IntPtr]::Zero
-$script:render = [IntPtr]::Zero
-while ([DateTime]::Now -lt $deadline) {
-    $script:target = [IntPtr]::Zero
-    $script:render = [IntPtr]::Zero
+function Update-WxWindow {
+    $script:curTarget = [IntPtr]::Zero
+    $script:curRender = [IntPtr]::Zero
     $cb = [WxApi+EnumProc]{
         param($h,$l)
         $t = New-Object System.Text.StringBuilder 256
@@ -141,85 +125,116 @@ while ([DateTime]::Now -lt $deadline) {
             return $true
         }
         [WxApi]::EnumChildWindows($h,$ccb,[IntPtr]::Zero) | Out-Null
-        if ($script:fr -ne [IntPtr]::Zero) { $script:target = $h; $script:render = $script:fr; return $false }
+        if ($script:fr -ne [IntPtr]::Zero) { $script:curTarget = $h; $script:curRender = $script:fr; return $false }
         return $true
     }
     [WxApi]::EnumWindows($cb,[IntPtr]::Zero) | Out-Null
-    if ($script:target -ne [IntPtr]::Zero) { break }
-    Start-Sleep -Milliseconds 250
 }
 
-$win = $script:target
-if ($win -eq [IntPtr]::Zero) {
-    Write-Host "No WeChat window found in ${TimeoutSec}s (already logged in? skip)."
-    exit 0
+function Get-WxRect([IntPtr]$hwnd){
+    $p = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+    [WxApi]::GetWindowRect($hwnd,$p) | Out-Null
+    $L = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,0)
+    $T = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,4)
+    $R = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,8)
+    $B = [System.Runtime.InteropServices.Marshal]::ReadInt32($p,12)
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($p)
+    return @{ L=$L; T=$T; R=$R; B=$B; W=($R-$L); H=($B-$T) }
 }
 
-# 读取渲染窗口矩形（指针方式，PS5.1 下 [ref] 会静默失败）
-$ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
-[WxApi]::GetWindowRect($script:render, $ptr) | Out-Null
-$L = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,0)
-$T = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,4)
-$R = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,8)
-$B = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr,12)
-[System.Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)
-
-$w = $R - $L
-$h = $B - $T
-if ($h -le $w) {
-    Write-Host "Main window detected, no click needed."
-    exit 0
+function Test-LoggedIn {
+    Update-WxWindow
+    if ($script:curRender -eq [IntPtr]::Zero) { return $true }
+    $r = Get-WxRect $script:curRender
+    return ($r.W -ge $r.H)
 }
-Write-Host "Login window detected, clicking Enter-WeChat..."
 
-[WxApi]::SetForegroundWindow($win) | Out-Null
-Start-Sleep -Milliseconds 300
+if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path $WeChatExe)) { Log "WeChat not found: $WeChatExe (skip)"; exit 0 }
+    Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
+    Log "WeChat starting..."
+}
 
-# 相对比例定位按钮（分辨率 / DPI 无关）
-$x = $L + [int]($w * $BtnX)
-$y = $T + [int]($h * $BtnY)
-Write-Host "Button at ($x,$y)"
+$deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
+$loginFound = $false
+while ([DateTime]::Now -lt $deadline) {
+    Update-WxWindow
+    if ($script:curTarget -ne [IntPtr]::Zero) {
+        $r0 = Get-WxRect $script:curRender
+        if ($r0.H -gt $r0.W) { $loginFound = $true; break }
+        if ($r0.W -ge $r0.H) { Log "Already in main window, nothing to click."; exit 0 }
+    }
+    Start-Sleep -Milliseconds 150
+}
+if (-not $loginFound) { Log "No login window within ${TimeoutSec}s (already logged in?). skip."; exit 0 }
 
-# 真实鼠标输入点击
-[WxApi]::SetCursorPos($x, $y) | Out-Null
-Start-Sleep -Milliseconds 80
-[WxApi]::mouse_event($LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
-Start-Sleep -Milliseconds 40
-[WxApi]::mouse_event($LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+$saved = New-Object 'WxApi+POINT'
+[WxApi]::GetCursorPos([ref]$saved) | Out-Null
 
-Write-Host "Clicked. Done."
-Start-Sleep -Milliseconds 1000
+$ok = $false
+for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+    if (Test-LoggedIn) { $ok = $true; break }
+    if ($script:curRender -eq [IntPtr]::Zero) { $ok = $true; break }
+
+    [WxApi]::SetForegroundWindow($script:curTarget) | Out-Null
+    Start-Sleep -Milliseconds 150
+
+    $r = Get-WxRect $script:curRender
+    $x = $r.L + [int]($r.W * $BtnX)
+    $y = $r.T + [int]($r.H * $BtnY)
+    Log ("Click attempt {0}/{1} at ({2},{3}) size {4}x{5}" -f $attempt,$MaxRetries,$x,$y,$r.W,$r.H)
+
+    [WxApi]::SetCursorPos($x,$y) | Out-Null
+    Start-Sleep -Milliseconds 60
+    [WxApi]::mouse_event($LEFTDOWN,0,0,0,[UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 30
+    [WxApi]::mouse_event($LEFTUP,0,0,0,[UIntPtr]::Zero)
+
+    $clickDeadline = [DateTime]::Now.AddSeconds(2.5)
+    while ([DateTime]::Now -lt $clickDeadline) {
+        Start-Sleep -Milliseconds 120
+        if (Test-LoggedIn) { $ok = $true; break }
+    }
+    if ($ok) { break }
+    Log "Not in main window yet, retrying..."
+}
+
+if ($RestoreMouse) { [WxApi]::SetCursorPos($saved.X,$saved.Y) | Out-Null }
+
+if ($ok) { Log "Logged in. Done."; exit 0 }
+else { Log "WARN: login not confirmed after $MaxRetries attempts, please click manually."; exit 1 }
 '@
 
-# 把检测到的微信路径写入生成脚本
+# 把检测到的微信路径填入生成脚本
 $mainContent = $mainContent.Replace('{WECHAT_EXE}', $wxExe)
 $mainContent = $mainContent.Replace('{WECHAT_DIR}', $wxDir)
 
 $mainPath = Join-Path $OutDir "wechat_autologin.ps1"
-# 写入文件（UTF-8 无 BOM；如需中文脚本请另存为 UTF-8 with BOM）
-[System.IO.File]::WriteAllText($mainPath, $mainContent, (New-Object System.Text.UTF8Encoding $false))
-Write-Host "[OK] Wrote: $mainPath"
+# 用 UTF-8【带 BOM】写入，保证 Windows PowerShell 5.1 下中文注释不乱码
+$utf8Bom = New-Object System.Text.UTF8Encoding $true
+[System.IO.File]::WriteAllText($mainPath, $mainContent, $utf8Bom)
+Write-Host "[OK] Wrote (UTF-8 BOM): $mainPath"
 
 # ---------- 第 4 步：配置开机自启 ----------
-$startup = [Environment]::GetFolderPath('Startup')   # 启动文件夹
+$startup = [Environment]::GetFolderPath('Startup')
 $ws = New-Object -ComObject WScript.Shell
 
 # 启动项 1：开机启动微信
 $l1 = $ws.CreateShortcut((Join-Path $startup "WeChat.lnk"))
 $l1.TargetPath  = $wxExe
-$l1.Description = "启动微信"
+$l1.Description = "Start WeChat"
 $l1.Save()
 
 # 启动项 2：开机隐藏运行自动登录脚本
 $l2 = $ws.CreateShortcut((Join-Path $startup "WeChatAutoLogin.lnk"))
 $l2.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $l2.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mainPath`""
-$l2.Description = "微信自动登录"
+$l2.Description = "WeChat auto login"
 $l2.Save()
 
 Write-Host "[OK] Autostart configured:"
 Write-Host "     WeChat.lnk          -> $wxExe"
 Write-Host "     WeChatAutoLogin.lnk -> $mainPath"
 Write-Host ""
-Write-Host "Done. On next login WeChat starts and auto-logs-in."
+Write-Host "Done. Run uninstall.ps1 to remove autostart."
 Write-Host "Tip: enable 'Auto login on this device' in WeChat (phone) to skip confirmation."
