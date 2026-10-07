@@ -8,7 +8,7 @@
 #   1) 自动识别微信安装位置（进程 → 常见目录 → 其它盘 → 注册表）；
 #   2) 自动识别屏幕物理分辨率 / DPI（脚本已 DPI 感知，按钮按比例定位）；
 #   3) 生成 wechat_autologin.ps1（UTF-8 带 BOM，不乱码）；
-#   4) 只创建“一个”开机自启入口 WeChatAutoLogin.lnk（开机立即运行，无固定
+#   4) 只创建“一个”开机自启入口——登录计划任务 WeChatAutoLogin（登录瞬间运行，无
 #      延迟；微信由脚本幂等启动，进程已在就不重复拉起）；
 #   5) 自动清理会导致开机多开的重复来源：
 #        - 启动文件夹里旧的 WeChat.lnk / 微信.lnk 等直接启动微信的快捷方式；
@@ -443,14 +443,14 @@ $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 [System.IO.File]::WriteAllText($outScript, $embedded, $utf8Bom)
 Write-Ok "已生成主脚本：$outScript"
 
-# ---------- 4. 清理重复开机启动源，只保留一个入口 ----------
+# ---------- 4. 清理重复开机启动源，只保留一个入口（登录计划任务，无启动延迟） ----------
+$taskName = 'WeChatAutoLogin'
 $startup = [Environment]::GetFolderPath('Startup')
-$wsh = New-Object -ComObject WScript.Shell
 
-# 4.1 删除启动文件夹里旧的、直接启动微信本体的快捷方式
-foreach($name in @('WeChat.lnk','微信.lnk','Weixin.lnk','微信自动登录.lnk')){
+# 4.1 删除启动文件夹里的旧入口（脚本快捷方式 + 直接启动微信本体的快捷方式）
+foreach($name in @('WeChatAutoLogin.lnk','WeChat.lnk','微信.lnk','Weixin.lnk','微信自动登录.lnk')){
     $old = Join-Path $startup $name
-    if(Test-Path $old){ Remove-Item $old -Force; Write-Warn2 "删除重复启动项：$name" }
+    if(Test-Path $old){ Remove-Item $old -Force; Write-Warn2 "删除启动文件夹旧入口：$name" }
 }
 
 # 4.2 移除注册表中微信自带的开机自启（HKCU\...\Run 的 Weixin / WeChat）
@@ -462,19 +462,19 @@ foreach($v in @('Weixin','WeChat')){
     }
 }
 
-# 4.3 只创建一个自启项：开机立即隐藏运行脚本（无固定延迟，脚本内部智能等待/启动微信）
-$lnkAuto = Join-Path $startup "WeChatAutoLogin.lnk"
-$s = $wsh.CreateShortcut($lnkAuto)
-$s.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
-$s.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$outScript`""
-$s.WorkingDirectory = $SetupDir
-$s.WindowStyle = 7
-$s.Description = "WeChat auto login (single entry)"
-$s.Save()
-Write-Ok "唯一开机自启入口：$lnkAuto"
+# 4.3 注册“用户登录时立即运行”的计划任务
+#     计划任务由系统计划服务在登录瞬间直接拉起，不受启动文件夹 / Run 项
+#     约 10 秒的“开机启动延迟”影响，因此比快捷方式更快。
+$psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+$taction = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$outScript`"" -WorkingDirectory $SetupDir
+$ttrig   = New-ScheduledTaskTrigger -AtLogOn
+$tset    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -RestartCount 0
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $taskName -Action $taction -Trigger $ttrig -Settings $tset -Description 'WeChat auto login at logon (single entry, no startup delay)' -Force | Out-Null
+Write-Ok "唯一开机自启入口：计划任务 '$taskName'（登录即运行，无启动延迟）"
 
 Write-Host ""
 Write-Ok "部署完成！开机只会启动一个微信并自动登录（脚本幂等启动，不再多开）。"
-Write-Host "    立即测试：powershell -ExecutionPolicy Bypass -File `"$outScript`"" -ForegroundColor Gray
+Write-Host "    立即测试：Start-ScheduledTask -TaskName '$taskName'（或直接运行主脚本）" -ForegroundColor Gray
 Write-Host "    卸载自启：运行 uninstall.ps1" -ForegroundColor Gray
-Write-Host "    说明：已关闭微信自带/旧的重复开机启动；如需恢复，在微信“设置-通用设置”里重新勾选开机自动启动即可。" -ForegroundColor Gray
+Write-Host "    说明：已改用登录计划任务（无开机启动延迟），并关闭微信自带/旧的重复启动，开机不会多开。" -ForegroundColor Gray
