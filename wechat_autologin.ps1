@@ -1,23 +1,27 @@
 ﻿# ============================================================
 # 微信 PC 自动登录脚本（零第三方依赖 / 纯 Windows API）
-# 由 setup.ps1 自动生成。
-# 作用：开机后由唯一的自启快捷方式调用，自动启动微信并点击绿色
-#       “进入WeChat”按钮进入主界面。
+# 作用：开机登录后由计划任务 WeChatAutoLogin 调用，自动启动微信并
+#       点击绿色“进入WeChat”按钮进入主界面。
+#
+# 不写死任何机器 / 用户信息：
+#   * 微信路径自动识别（正在运行的进程 → 常见安装目录 → 各盘符 →
+#     注册表卸载信息），也可用 -WeChatExe 手动指定；
+#   * 脚本内不含用户名、计算机名或固定用户目录，拷到任意电脑可直接运行。
 #
 # 设计要点（避免开机多开 / 提速）：
 #   * 幂等启动：微信进程已存在（正在开机初始化）就只等待、绝不重复拉起；
 #               只有进程不存在时才启动一次。
 #   * 唤起节流：进程在但无可见窗口时，先宽限一段时间，之后每隔较长时间
 #               才唤起一次，避免和微信自带开机启动叠加而多开。
-#   * 无固定睡眠：开机即运行，登录窗 / 绿色按钮一就绪就动作，不干等。
+#   * 无固定睡眠：登录即运行，登录窗 / 绿色按钮一就绪就动作，不干等。
 #   * 检测之后再点击：GetPixel 读取按钮区域像素颜色，确认绿色按钮已渲染
 #               就绪才点击（不截图、不存图、不做图像匹配），通常 1 次命中。
 # ============================================================
 
 [CmdletBinding()]
 param(
-    [string]$WeChatExe  = "D:\WeChat\Weixin\Weixin.exe",
-    [string]$WeChatDir  = "D:\WeChat\Weixin",
+    [string]$WeChatExe  = "",
+    [string]$WeChatDir  = "",
     [int]$WindowTimeoutSec  = 30,
     [int]$ButtonTimeoutSec  = 60,
     [double]$BtnX       = 0.498,
@@ -74,6 +78,53 @@ function Get-WeChatPids {
     @(Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ProcessName -match '^(Weixin|WeChat)$' } |
         Select-Object -ExpandProperty Id)
+}
+
+# 自动查找微信可执行文件：正在运行的进程 → 常见安装目录 → 各盘符 → 注册表
+function Find-WeChatExe {
+    foreach ($name in @('Weixin','WeChat')) {
+        $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($p -and $p.Path -and (Test-Path $p.Path)) { return $p.Path }
+    }
+    $candidates = @(
+        "$env:ProgramFiles\Tencent\Weixin\Weixin.exe",
+        "${env:ProgramFiles(x86)}\Tencent\Weixin\Weixin.exe",
+        "$env:LOCALAPPDATA\Tencent\Weixin\Weixin.exe",
+        "D:\WeChat\Weixin\Weixin.exe",
+        "D:\Program Files\Tencent\Weixin\Weixin.exe",
+        "D:\Program Files (x86)\Tencent\Weixin\Weixin.exe",
+        "C:\WeChat\Weixin\Weixin.exe",
+        "$env:ProgramFiles\Tencent\WeChat\WeChat.exe",
+        "${env:ProgramFiles(x86)}\Tencent\WeChat\WeChat.exe",
+        "D:\WeChat\WeChat.exe",
+        "D:\Program Files\Tencent\WeChat\WeChat.exe",
+        "D:\Program Files (x86)\Tencent\WeChat\WeChat.exe"
+    )
+    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem).Root) {
+        foreach ($sub in @('WeChat\Weixin','WeChat','Program Files\Tencent\Weixin','Program Files (x86)\Tencent\Weixin')) {
+            $g = Join-Path $drive ($sub + '\Weixin.exe')
+            if (Test-Path $g) { return $g }
+        }
+    }
+    $script:foundExe = $null
+    foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                      'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+        try {
+            Get-ItemProperty $key -ErrorAction SilentlyContinue | ForEach-Object {
+                $loc = $_.InstallLocation
+                if ($loc) {
+                    foreach ($exe in @('Weixin.exe','WeChat.exe')) {
+                        $g = Join-Path $loc $exe
+                        if (Test-Path $g) { $script:foundExe = $g }
+                    }
+                }
+            }
+        } catch {}
+        if ($script:foundExe) { return $script:foundExe }
+    }
+    return $null
 }
 
 function Get-WxRect([IntPtr]$hwnd) {
@@ -220,11 +271,18 @@ function Bring-ToFront([IntPtr]$hwnd) {
     [void][WxApi]::AttachThreadInput($curThread, $fgThread, $false)
 }
 
+# 启动微信（幂等：调用方保证只在需要时调用）。路径未指定 / 失效则自动查找。
 function Start-WeChat {
-    if (Test-Path $WeChatExe) {
-        Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
+    $exe = $WeChatExe
+    if (-not $exe -or -not (Test-Path $exe)) { $exe = Find-WeChatExe }
+    if ($exe -and (Test-Path $exe)) {
+        $dir = $WeChatDir
+        if (-not $dir) { $dir = Split-Path $exe -Parent }
+        if (-not $WeChatExe) { Log "auto-detected WeChat: $exe" }
+        Start-Process -FilePath $exe -WorkingDirectory $dir
     } else {
-        Write-Host ("[{0}] WARN: 未找到微信程序 {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $WeChatExe)
+        Log "ERROR: 找不到微信程序，请用 -WeChatExe 指定 Weixin.exe 的完整路径。"
+        exit 1
     }
 }
 
