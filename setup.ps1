@@ -2,9 +2,9 @@
 # 一键部署安装器（setup.ps1）—— 改进版
 # ------------------------------------------------------------
 # 运行一次即可完成全部部署：
-#   1. 自动识别微信安装位置（进程 / 常见目录）
+#   1. 自动识别微信安装位置（运行中进程 / 常见安装目录）
 #   2. 自动识别屏幕物理分辨率 + DPI（按钮用相对比例，自动适配）
-#   3. 生成自动登录脚本（微信路径自动填入，UTF-8 带 BOM，中文注释不乱码）
+#   3. 生成自动登录脚本（微信路径自动填入，UTF-8 带 BOM，中文不乱码）
 #   4. 配置开机自启（启动微信 + 隐藏运行自动登录）
 # 卸载：运行 uninstall.ps1
 # 用法：powershell -ExecutionPolicy Bypass -File setup.ps1
@@ -18,17 +18,19 @@ $ErrorActionPreference = 'Stop'
 # ---------- 第 1 步：自动识别微信安装位置 ----------
 function Find-WeChatExe {
     # 优先：从正在运行的微信进程取真实路径
-    $p = Get-Process -Name "Weixin" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($p -and $p.Path -and (Test-Path $p.Path)) { return $p.Path }
-
+    foreach ($n in @('Weixin','WeChat')) {
+        $p = Get-Process -Name $n -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($p -and $p.Path -and (Test-Path $p.Path)) { return $p.Path }
+    }
     # 其次：扫描常见安装目录
     $roots = @("$env:ProgramFiles", "${env:ProgramFiles(x86)}",
                "D:\", "C:\Program Files", "$env:LOCALAPPDATA\Programs")
     $names = @("WeChat\Weixin\Weixin.exe", "Tencent\WeChat\Weixin.exe",
-               "Weixin\Weixin.exe", "Tencent\Weixin\Weixin.exe")
+               "Weixin\Weixin.exe", "Tencent\Weixin\Weixin.exe",
+               "Tencent\WeChat\WeChat.exe", "WeChat\WeChat.exe")
     foreach ($r in $roots) {
-        foreach ($n in $names) {
-            $c = Join-Path $r $n
+        foreach ($nm in $names) {
+            $c = Join-Path $r $nm
             if (Test-Path $c) { return $c }
         }
     }
@@ -66,7 +68,8 @@ Write-Host "WeChat location   : $wxExe"
 $mainContent = @'
 # ============================================================
 # 微信自动登录脚本（由 setup.ps1 自动生成，UTF-8 带 BOM）
-# 改进点：事件驱动更快、点击失败自动重试、登录后鼠标归位。
+# 不依赖窗口标题语言；进程驻留托盘时自动唤起；事件驱动、点击校验
+# 重试、登录后鼠标归位。零第三方依赖。
 # ============================================================
 param(
     [string]$WeChatExe  = "{WECHAT_EXE}",
@@ -97,6 +100,7 @@ public class WxApi {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     public struct POINT { public int X; public int Y; }
 }
 "@
@@ -107,15 +111,26 @@ $LEFTUP   = 0x0004
 
 function Log([string]$msg){ Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $msg) }
 
+function Get-WxPids {
+    $ids = New-Object System.Collections.Generic.List[int]
+    foreach ($n in @('Weixin','WeChat')) {
+        Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not $ids.Contains($_.Id)) { $ids.Add($_.Id) }
+        }
+    }
+    return ,$ids
+}
+
 function Update-WxWindow {
     $script:curTarget = [IntPtr]::Zero
     $script:curRender = [IntPtr]::Zero
+    $script:wxPids = Get-WxPids
     $cb = [WxApi+EnumProc]{
         param($h,$l)
-        $t = New-Object System.Text.StringBuilder 256
-        [WxApi]::GetWindowText($h,$t,256) | Out-Null
-        if ($t.ToString() -ne 'WeChat') { return $true }
         if (-not [WxApi]::IsWindowVisible($h)) { return $true }
+        $procId = 0
+        [WxApi]::GetWindowThreadProcessId($h,[ref]$procId) | Out-Null
+        if ($script:wxPids -notcontains [int]$procId) { return $true }
         $script:fr = [IntPtr]::Zero
         $ccb = [WxApi+ChildProc]{
             param($ch,$cl)
@@ -125,7 +140,11 @@ function Update-WxWindow {
             return $true
         }
         [WxApi]::EnumChildWindows($h,$ccb,[IntPtr]::Zero) | Out-Null
-        if ($script:fr -ne [IntPtr]::Zero) { $script:curTarget = $h; $script:curRender = $script:fr; return $false }
+        if ($script:fr -ne [IntPtr]::Zero) {
+            $script:curTarget = $h
+            $script:curRender = $script:fr
+            return $false
+        }
         return $true
     }
     [WxApi]::EnumWindows($cb,[IntPtr]::Zero) | Out-Null
@@ -149,20 +168,34 @@ function Test-LoggedIn {
     return ($r.W -ge $r.H)
 }
 
-if (-not (Get-Process -Name "Weixin" -ErrorAction SilentlyContinue)) {
-    if (-not (Test-Path $WeChatExe)) { Log "WeChat not found: $WeChatExe (skip)"; exit 0 }
+function Invoke-WxStart {
+    if (-not (Test-Path $WeChatExe)) { Log "WeChat exe not found: $WeChatExe (skip)"; exit 0 }
     Start-Process -FilePath $WeChatExe -WorkingDirectory $WeChatDir
-    Log "WeChat starting..."
+}
+
+Update-WxWindow
+if ($script:curRender -eq [IntPtr]::Zero) {
+    Log "launch / activate WeChat..."
+    Invoke-WxStart
+} else {
+    Log "WeChat window already visible."
 }
 
 $deadline = [DateTime]::Now.AddSeconds($TimeoutSec)
+$lastRelaunch = [DateTime]::Now
 $loginFound = $false
 while ([DateTime]::Now -lt $deadline) {
     Update-WxWindow
-    if ($script:curTarget -ne [IntPtr]::Zero) {
+    if ($script:curRender -ne [IntPtr]::Zero) {
         $r0 = Get-WxRect $script:curRender
         if ($r0.H -gt $r0.W) { $loginFound = $true; break }
         if ($r0.W -ge $r0.H) { Log "Already in main window, nothing to click."; exit 0 }
+    } else {
+        if (([DateTime]::Now - $lastRelaunch).TotalSeconds -ge 5) {
+            Log "no visible window yet, re-activating WeChat..."
+            Invoke-WxStart
+            $lastRelaunch = [DateTime]::Now
+        }
     }
     Start-Sleep -Milliseconds 150
 }
