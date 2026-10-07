@@ -1,47 +1,49 @@
-﻿# ============================================================
-# 微信 PC 自动登录脚本（零第三方依赖 / 纯 Windows API）
-# 作用：开机登录后由计划任务 WeChatAutoLogin 调用，自动启动微信并
-#       点击绿色“进入WeChat”按钮进入主界面。
-#
-# 不写死任何机器 / 用户信息：
-#   * 微信路径自动识别（正在运行的进程 → 常见安装目录 → 各盘符 →
-#     注册表卸载信息），也可用 -WeChatExe 手动指定；
-#   * 脚本内不含用户名、计算机名或固定用户目录，拷到任意电脑可直接运行。
-#
-# 设计要点（避免开机多开 / 提速）：
-#   * 幂等启动：微信进程已存在（正在开机初始化）就只等待、绝不重复拉起；
-#               只有进程不存在时才启动一次。
-#   * 唤起节流：进程在但无可见窗口时，先宽限一段时间，之后每隔较长时间
-#               才唤起一次，避免和微信自带开机启动叠加而多开。
-#   * 无固定睡眠：登录即运行，登录窗 / 绿色按钮一就绪就动作，不干等。
-#   * 检测之后再点击：GetPixel 读取按钮区域像素颜色，确认绿色按钮已渲染
-#               就绪才点击（不截图、不存图、不做图像匹配），通常 1 次命中。
-# ============================================================
-
+﻿#requires -Version 5.1
+# WeChat PC auto-login for the MMUIRenderSubWindowHW renderer (typically Weixin 4.x).
+# Interactive unlocked desktop and prior mobile authorization are required.
+# Only one script instance per session; an existing WeChat process is never relaunched.
+# Success means a stable, supported main-window shape, not verified server authentication.
+# See README.md for compatibility, logs and recovery instructions.
 [CmdletBinding()]
 param(
     [string]$WeChatExe  = "",
     [string]$WeChatDir  = "",
-    [int]$WindowTimeoutSec  = 30,
-    [int]$ButtonTimeoutSec  = 60,
-    [double]$BtnX       = 0.498,
-    [double]$BtnY       = 0.773,
-    [double]$GreenRatio = 0.30,
-    [int]$MaxRetries    = 5,
-    [int]$MinReadyMs    = 250,
-    [int]$ReviveGraceSec   = 12,
-    [int]$ReviveIntervalSec = 8,
+    [ValidateRange(1,120)][int]$WindowTimeoutSec  = 30,
+    [ValidateRange(1,120)][int]$ButtonTimeoutSec  = 60,
+    [ValidateRange(0.01,0.99)][double]$BtnX       = 0.498,
+    [ValidateRange(0.01,0.99)][double]$BtnY       = 0.773,
+    [ValidateRange(0.01,1.0)][double]$GreenRatio = 0.30,
+    [ValidateRange(1,10)][int]$MaxRetries    = 5,
+    [ValidateRange(0,10000)][int]$MinReadyMs    = 250,
+    [ValidateRange(0,120)][int]$ReviveGraceSec   = 12,
+    [ValidateRange(1,120)][int]$ReviveIntervalSec = 8,
     [bool]$RestoreMouse = $true,
-    [switch]$DontLaunch
+    [switch]$DontLaunch,
+    [ValidateRange(1,120)][int]$LoginTimeoutSec = 30,
+    [string]$LogPath = (Join-Path $env:LOCALAPPDATA 'WeChatAutoLogin\autologin.log')
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'wechat_common.ps1')
+
+$SW_RESTORE = 9
+
+function Initialize-WxApi {
+    if (-not ('WxApi' -as [type])) {
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
 public class WxApi {
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; public POINT(int x, int y) { X=x; Y=y; } }
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool GetUserObjectInformation(IntPtr handle, int index, StringBuilder info, int length, out uint needed);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
@@ -64,73 +66,29 @@ public class WxApi {
     [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr hdc, int nXPos, int nYPos);
 }
 "@
-
-[WxApi]::SetProcessDPIAware() | Out-Null
-
-$MOUSEEVENTF_MOVE     = 0x0001
-$MOUSEEVENTF_LEFTDOWN = 0x0002
-$MOUSEEVENTF_LEFTUP   = 0x0004
-$SW_RESTORE           = 9
-
-function Log($msg) { Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $msg) }
-
-function Get-WeChatPids {
-    @(Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessName -match '^(Weixin|WeChat)$' } |
-        Select-Object -ExpandProperty Id)
+    }
+    try {
+        if (-not [WxApi]::SetProcessDpiAwarenessContext([IntPtr](-4))) { [void][WxApi]::SetProcessDPIAware() }
+    } catch { [void][WxApi]::SetProcessDPIAware() }
+    Add-Type -AssemblyName System.Windows.Forms
 }
 
-# 自动查找微信可执行文件：正在运行的进程 → 常见安装目录 → 各盘符 → 注册表
-function Find-WeChatExe {
-    foreach ($name in @('Weixin','WeChat')) {
-        $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($p -and $p.Path -and (Test-Path $p.Path)) { return $p.Path }
-    }
-    $candidates = @(
-        "$env:ProgramFiles\Tencent\Weixin\Weixin.exe",
-        "${env:ProgramFiles(x86)}\Tencent\Weixin\Weixin.exe",
-        "$env:LOCALAPPDATA\Tencent\Weixin\Weixin.exe",
-        "D:\WeChat\Weixin\Weixin.exe",
-        "D:\Program Files\Tencent\Weixin\Weixin.exe",
-        "D:\Program Files (x86)\Tencent\Weixin\Weixin.exe",
-        "C:\WeChat\Weixin\Weixin.exe",
-        "$env:ProgramFiles\Tencent\WeChat\WeChat.exe",
-        "${env:ProgramFiles(x86)}\Tencent\WeChat\WeChat.exe",
-        "D:\WeChat\WeChat.exe",
-        "D:\Program Files\Tencent\WeChat\WeChat.exe",
-        "D:\Program Files (x86)\Tencent\WeChat\WeChat.exe"
-    )
-    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
-    foreach ($drive in (Get-PSDrive -PSProvider FileSystem).Root) {
-        foreach ($sub in @('WeChat\Weixin','WeChat','Program Files\Tencent\Weixin','Program Files (x86)\Tencent\Weixin')) {
-            $g = Join-Path $drive ($sub + '\Weixin.exe')
-            if (Test-Path $g) { return $g }
-        }
-    }
-    $script:foundExe = $null
-    foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                      'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
-        try {
-            Get-ItemProperty $key -ErrorAction SilentlyContinue | ForEach-Object {
-                $loc = $_.InstallLocation
-                if ($loc) {
-                    foreach ($exe in @('Weixin.exe','WeChat.exe')) {
-                        $g = Join-Path $loc $exe
-                        if (Test-Path $g) { $script:foundExe = $g }
-                    }
-                }
-            }
-        } catch {}
-        if ($script:foundExe) { return $script:foundExe }
-    }
-    return $null
+function Log($msg) {
+    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $msg
+    Write-Host $line
+    try {
+        $parent = Split-Path $LogPath -Parent
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent -Force) }
+        if ((Test-Path -LiteralPath $LogPath) -and (Get-Item -LiteralPath $LogPath).Length -gt 1MB) { Move-Item -LiteralPath $LogPath -Destination ($LogPath + '.1') -Force }
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    } catch { Write-Warning "Could not write log: $_" }
 }
 
 function Get-WxRect([IntPtr]$hwnd) {
+    if (-not [WxApi]::IsWindow($hwnd)) { return $null }
     $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
     try {
-        [void][WxApi]::GetWindowRect($hwnd, $ptr)
+        if (-not [WxApi]::GetWindowRect($hwnd, $ptr)) { return $null }
         $l = [Runtime.InteropServices.Marshal]::ReadInt32($ptr, 0)
         $t = [Runtime.InteropServices.Marshal]::ReadInt32($ptr, 4)
         $r = [Runtime.InteropServices.Marshal]::ReadInt32($ptr, 8)
@@ -140,14 +98,11 @@ function Get-WxRect([IntPtr]$hwnd) {
     finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }
 }
 
-$script:curTarget = [IntPtr]::Zero
-$script:curRender = [IntPtr]::Zero
-
 function Update-WxWindow {
     $script:curTarget = [IntPtr]::Zero
     $script:curRender = [IntPtr]::Zero
     $pids = Get-WeChatPids
-    if ($pids.Count -eq 0) { return }
+    if (@($pids).Count -eq 0) { return }
 
     $enumTop = [WxApi+EnumWindowsProc]{
         param($top, $lp)
@@ -170,7 +125,7 @@ function Update-WxWindow {
         [void][WxApi]::EnumChildWindows($top, $enumChild, [IntPtr]::Zero)
         if ($script:foundRender -ne [IntPtr]::Zero) {
             $rc = Get-WxRect $script:foundRender
-            if ($rc.H -gt $rc.W) {
+            if ($rc -and $rc.W -ge 200 -and $rc.H -gt $rc.W) {
                 $script:curTarget = $top
                 $script:curRender = $script:foundRender
                 return $false
@@ -183,7 +138,7 @@ function Update-WxWindow {
 
 function Test-LoggedIn {
     $pids = Get-WeChatPids
-    if ($pids.Count -eq 0) { return $false }
+    if (@($pids).Count -eq 0) { return $false }
     $enumTop = [WxApi+EnumWindowsProc]{
         param($top, $lp)
         if (-not [WxApi]::IsWindowVisible($top)) { return $true }
@@ -196,7 +151,7 @@ function Test-LoggedIn {
             [void][WxApi]::GetClassName($child, $sb, 256)
             if ($sb.ToString() -eq 'MMUIRenderSubWindowHW') {
                 $rc = Get-WxRect $child
-                if ($rc.W -ge $rc.H) { $script:loggedIn = $true; return $false }
+                if ($rc -and $rc.W -ge 500 -and $rc.H -ge 300 -and $rc.W -gt $rc.H) { $script:loggedIn = $true; return $false }
             }
             return $true
         }
@@ -216,8 +171,10 @@ function Test-GreenPixel([int]$cr,[int]$cg,[int]$cb) {
 
 function Test-ButtonReady([ref]$Info) {
     if ($script:curRender -eq [IntPtr]::Zero) { if ($Info) { $Info.Value = $null }; return $false }
+    if ([WxApi]::GetForegroundWindow() -ne $script:curTarget) { return $false }
     $r = Get-WxRect $script:curRender
-    if ($r.W -ge $r.H) { if ($Info) { $Info.Value = $null }; return $false }
+    if (-not $r -or $r.W -ge $r.H) { if ($Info) { $Info.Value = $null }; return $false }
+    if (-not (Test-InteractiveDesktop)) { return $false }
 
     $cx = $r.L + [int]($r.W * $BtnX)
     $cy = $r.T + [int]($r.H * $BtnY)
@@ -225,13 +182,16 @@ function Test-ButtonReady([ref]$Info) {
     $ry = [int]($r.H * 0.016)
 
     $hdc = [WxApi]::GetDC([IntPtr]::Zero)
+    if ($hdc -eq [IntPtr]::Zero) { return $false }
     try {
         $green = 0; $total = 0; $centerColor = 0
         for ($ix = -4; $ix -le 4; $ix++) {
             for ($iy = -1; $iy -le 1; $iy++) {
                 $x = $cx + [int]($rx * ($ix / 4.0))
                 $y = $cy + [int]($ry * $iy)
+                if (-not (Test-PointOwnedByWeChat $x $y)) { return $false }
                 $c = [WxApi]::GetPixel($hdc, $x, $y)
+                if ($c -eq [uint32]::MaxValue) { return $false }
                 if ($ix -eq 0 -and $iy -eq 0) { $centerColor = $c }
                 $cr = $c -band 0xFF
                 $cg = ($c -shr 8) -band 0xFF
@@ -255,129 +215,185 @@ function Test-ButtonReady([ref]$Info) {
     return ($ratio -ge $GreenRatio)
 }
 
+function Test-InteractiveDesktop {
+    $desktop = [WxApi]::OpenInputDesktop(0, $false, 1)
+    if ($desktop -eq [IntPtr]::Zero) { return $false }
+    try {
+        $name = New-Object Text.StringBuilder 256
+        [uint32]$needed = 0
+        return ([WxApi]::GetUserObjectInformation($desktop, 2, $name, 512, [ref]$needed) -and $name.ToString() -eq 'Default')
+    } finally { [void][WxApi]::CloseDesktop($desktop) }
+}
+
+function Test-PointOwnedByWeChat([int]$X, [int]$Y) {
+    $point = New-Object WxApi+POINT($X, $Y)
+    $window = [WxApi]::WindowFromPoint($point)
+    return ($window -ne [IntPtr]::Zero -and [WxApi]::GetAncestor($window, 2) -eq $script:curTarget)
+}
+
+function Test-LoginConfirmed {
+    for ($sample = 0; $sample -lt 3; $sample++) {
+        if (-not (Test-LoggedIn)) { return $false }
+        Update-WxWindow
+        if ($script:curRender -ne [IntPtr]::Zero) { return $false }
+        if ($sample -lt 2) { Start-Sleep -Milliseconds 150 }
+    }
+    return $true
+}
+
 function Bring-ToFront([IntPtr]$hwnd) {
-    if ($hwnd -eq [IntPtr]::Zero) { return }
+    if ($hwnd -eq [IntPtr]::Zero) { return $false }
     [void][WxApi]::ShowWindow($hwnd, $SW_RESTORE)
-    if ([WxApi]::GetForegroundWindow() -eq $hwnd) { return }
+    if ([WxApi]::GetForegroundWindow() -eq $hwnd) { return $true }
     $fg = [WxApi]::GetForegroundWindow()
     $curThread = [WxApi]::GetCurrentThreadId()
     $fgThread  = [WxApi]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
     $targetThread = [WxApi]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
-    [void][WxApi]::AttachThreadInput($curThread, $fgThread, $true)
-    [void][WxApi]::AttachThreadInput($curThread, $targetThread, $true)
-    [void][WxApi]::BringWindowToTop($hwnd)
-    [void][WxApi]::SetForegroundWindow($hwnd)
-    [void][WxApi]::AttachThreadInput($curThread, $targetThread, $false)
-    [void][WxApi]::AttachThreadInput($curThread, $fgThread, $false)
+    $attachedFg = $false; $attachedTarget = $false
+    try {
+        if ($fgThread -ne 0 -and $fgThread -ne $curThread) { $attachedFg = [WxApi]::AttachThreadInput($curThread, $fgThread, $true) }
+        if ($targetThread -ne 0 -and $targetThread -ne $curThread -and $targetThread -ne $fgThread) { $attachedTarget = [WxApi]::AttachThreadInput($curThread, $targetThread, $true) }
+        [void][WxApi]::BringWindowToTop($hwnd)
+        [void][WxApi]::SetForegroundWindow($hwnd)
+    } finally {
+        if ($attachedTarget) { [void][WxApi]::AttachThreadInput($curThread, $targetThread, $false) }
+        if ($attachedFg) { [void][WxApi]::AttachThreadInput($curThread, $fgThread, $false) }
+    }
+    return ([WxApi]::GetForegroundWindow() -eq $hwnd)
 }
 
-# 启动微信（幂等：调用方保证只在需要时调用）。路径未指定 / 失效则自动查找。
 function Start-WeChat {
-    $exe = $WeChatExe
-    if (-not $exe -or -not (Test-Path $exe)) { $exe = Find-WeChatExe }
-    if ($exe -and (Test-Path $exe)) {
-        $dir = $WeChatDir
-        if (-not $dir) { $dir = Split-Path $exe -Parent }
-        if (-not $WeChatExe) { Log "auto-detected WeChat: $exe" }
-        Start-Process -FilePath $exe -WorkingDirectory $dir
-    } else {
-        Log "ERROR: 找不到微信程序，请用 -WeChatExe 指定 Weixin.exe 的完整路径。"
-        exit 1
-    }
+    if (@(Get-WeChatPids).Count -gt 0) { Log 'WeChat is already running; not launching another process.'; return }
+    $exe = Resolve-WeChatExe $WeChatExe
+    $dir = $WeChatDir
+    if (-not $dir) { $dir = Split-Path $exe -Parent }
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw 'WeChatDir must be an existing directory.' }
+    Log "Launching WeChat: $exe"
+    Start-Process -FilePath $exe -WorkingDirectory $dir | Out-Null
 }
 
-$scriptStart = Get-Date
+function Get-WeChatPids { @(Get-WeChatProcesses | Select-Object -ExpandProperty Id) }
 
-if ((Get-WeChatPids).Count -gt 0) {
-    Log "WeChat already running; wait for its login window (will NOT launch again)."
-} elseif ($DontLaunch) {
-    Log "No WeChat process; -DontLaunch set, waiting for an external launch..."
-} else {
-    Log "No WeChat process; launching WeChat once..."
-    Start-WeChat
-}
-
-$winDeadline = (Get-Date).AddSeconds($WindowTimeoutSec)
-$lastRect = $null; $stableCount = 0; $firstSeen = $null
-$loginFound = $false
-$nextReviveAt = (Get-Date).AddSeconds($ReviveGraceSec)
-
-while ((Get-Date) -lt $winDeadline) {
-    Update-WxWindow
-    if ($script:curRender -ne [IntPtr]::Zero) {
-        if (-not $firstSeen) { $firstSeen = Get-Date }
-        $r = Get-WxRect $script:curRender
-        if ($lastRect -and $r.L -eq $lastRect.L -and $r.T -eq $lastRect.T -and $r.W -eq $lastRect.W -and $r.H -eq $lastRect.H) {
-            $stableCount++
-        } else { $stableCount = 0 }
-        $lastRect = $r
-        if ($stableCount -ge 2 -and ((Get-Date) - $firstSeen).TotalMilliseconds -ge $MinReadyMs) {
-            $loginFound = $true; break
-        }
-    } else {
-        if (Test-LoggedIn) { Log "already logged in. Done."; exit 0 }
-        if ((Get-Date) -ge $nextReviveAt) {
-            if (-not $DontLaunch) {
-                if ((Get-WeChatPids).Count -eq 0) { Log "process missing, launching once..." }
-                else { Log "no visible window, reviving once (throttled)..." }
-                Start-WeChat
-            }
-            $nextReviveAt = (Get-Date).AddSeconds($ReviveIntervalSec)
-        }
-    }
-    Start-Sleep -Milliseconds 150
-}
-
-if (-not $loginFound) {
-    if (Test-LoggedIn) { Log "already logged in. Done."; exit 0 }
-    Log "WARN: $WindowTimeoutSec 秒内未找到微信登录窗。"; exit 1
-}
-Log ("login window ready after {0} ms" -f [int]($firstSeen - $scriptStart).TotalMilliseconds)
-
-Add-Type -AssemblyName System.Windows.Forms
-$startPos = [System.Windows.Forms.Cursor]::Position
-
-$ok = $false
-for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-    $diag = $null; $ready = $false
-    $btnDeadline = (Get-Date).AddSeconds($ButtonTimeoutSec)
-    while ((Get-Date) -lt $btnDeadline) {
-        Update-WxWindow
-        if ($script:curRender -eq [IntPtr]::Zero) { $ok = $true; break }
-        $rr = Get-WxRect $script:curRender
-        if ($rr.W -ge $rr.H) { $ok = $true; break }
-        $d = $null
-        if (Test-ButtonReady ([ref]$d)) { $ready = $true; $diag = $d; break }
-        Start-Sleep -Milliseconds 120
-    }
-    if ($ok) { break }
-    if (-not $ready) { Log "WARN: $ButtonTimeoutSec 秒内未检测到绿色登录按钮（按钮未就绪）。"; break }
-    Log ("green login button READY (green ratio {0:P0}, center RGB {1},{2},{3})" -f $diag.Ratio, $diag.CenterR, $diag.CenterG, $diag.CenterB)
-
-    Bring-ToFront $script:curTarget
+function Invoke-WeChatClick {
+    if (-not (Bring-ToFront $script:curTarget)) { return $false }
     Start-Sleep -Milliseconds 120
-    $r = Get-WxRect $script:curRender
-    $x = $r.L + [int]($r.W * $BtnX)
-    $y = $r.T + [int]($r.H * $BtnY)
-    Log ("Click attempt {0}/{1} at ({2},{3}) size {4}x{5}" -f $attempt,$MaxRetries,$x,$y,$r.W,$r.H)
-
-    [WxApi]::SetCursorPos($x,$y) | Out-Null
-    [WxApi]::mouse_event($MOUSEEVENTF_MOVE,0,0,0,[UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 60
-    [WxApi]::mouse_event($MOUSEEVENTF_LEFTDOWN,0,0,0,[UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 18
-    [WxApi]::mouse_event($MOUSEEVENTF_LEFTUP,0,0,0,[UIntPtr]::Zero)
-
-    $inDeadline = (Get-Date).AddSeconds(4)
-    while ((Get-Date) -lt $inDeadline) {
-        Start-Sleep -Milliseconds 100
-        if (Test-LoggedIn) { $ok = $true; break }
+    Update-WxWindow
+    $info = $null
+    if (-not (Test-ButtonReady ([ref]$info))) { return $false }
+    $x = $info.Cx; $y = $info.Cy
+    if ([WxApi]::GetForegroundWindow() -ne $script:curTarget -or
+        -not (Test-InteractiveDesktop) -or -not (Test-PointOwnedByWeChat $x $y)) { return $false }
+    $position = [System.Windows.Forms.Cursor]::Position
+    $moved = $false; $buttonDown = $false
+    try {
+        if (-not [WxApi]::SetCursorPos($x,$y)) { throw 'Could not move cursor; refusing to click.' }
+        $moved = $true
+        $current = [System.Windows.Forms.Cursor]::Position
+        if ($current.X -ne $x -or $current.Y -ne $y -or
+            [WxApi]::GetForegroundWindow() -ne $script:curTarget -or
+            -not (Test-InteractiveDesktop) -or -not (Test-PointOwnedByWeChat $x $y)) { return $false }
+        $finalInfo = $null
+        if (-not (Test-ButtonReady ([ref]$finalInfo)) -or $finalInfo.Cx -ne $x -or $finalInfo.Cy -ne $y) { return $false }
+        Log "Clicking supported login button at ($x,$y)."
+        $buttonDown = $true
+        [WxApi]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 18
+        [WxApi]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero)
+        $buttonDown = $false
+        return $true
+    } finally {
+        if ($buttonDown) { [WxApi]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero) }
+        if ($moved -and $RestoreMouse) { [void][WxApi]::SetCursorPos($position.X,$position.Y) }
     }
-    if ($ok) { break }
-    Log "clicked but main UI not shown yet, re-detecting..."
 }
 
-if ($RestoreMouse) { [WxApi]::SetCursorPos($startPos.X, $startPos.Y) | Out-Null }
+function Invoke-WeChatAutoLogin {
+    $scriptStart = Get-Date
+    $totalDeadline = $scriptStart.AddSeconds(270)
+    $launched = $false
+    Log 'Auto-login started (interactive unlocked desktop required).'
+    if (@(Get-WeChatPids).Count -gt 0) {
+        Log 'WeChat already running; waiting without relaunching.'
+    } elseif ($DontLaunch) {
+        Log 'DontLaunch enabled; waiting for external launch.'
+    } else {
+        Start-WeChat
+        $launched = $true
+    }
+    $winDeadline = (Get-Date).AddSeconds($WindowTimeoutSec)
+    $lastRect = $null; $stableCount = 0; $firstSeen = $null
+    $loginFound = $false
+    $nextCheckAt = (Get-Date).AddSeconds($ReviveGraceSec)
+    while ((Get-Date) -lt $winDeadline) {
+        if (Test-LoginConfirmed) { Log 'Supported main window already visible. Done.'; return 0 }
+        Update-WxWindow
+        if ($script:curRender -ne [IntPtr]::Zero) {
+            $rect = Get-WxRect $script:curRender
+            if ($rect -and $lastRect -and $rect.L -eq $lastRect.L -and $rect.T -eq $lastRect.T -and
+                $rect.W -eq $lastRect.W -and $rect.H -eq $lastRect.H) { $stableCount++ }
+            else { $stableCount = 0; $firstSeen = Get-Date }
+            $lastRect = $rect
+            if ($rect -and $stableCount -ge 2 -and ((Get-Date)-$firstSeen).TotalMilliseconds -ge $MinReadyMs) { $loginFound = $true; break }
+        } else {
+            $lastRect=$null; $stableCount=0; $firstSeen=$null
+            if ((Get-Date) -ge $nextCheckAt -and -not $DontLaunch) {
+                if (@(Get-WeChatPids).Count -eq 0) {
+                    if ($launched) { throw 'WeChat exited while waiting for its login window.' }
+                    Start-WeChat
+                    $launched = $true
+                }
+                $nextCheckAt = (Get-Date).AddSeconds($ReviveIntervalSec)
+            }
+        }
+        Start-Sleep -Milliseconds 150
+    }
+    if (-not $loginFound) {
+        if (Test-LoginConfirmed) { Log 'Supported main window visible. Done.'; return 0 }
+        Log "WARN: No supported login window within $WindowTimeoutSec seconds. Check WeChat version and desktop/session state."
+        return 1
+    }
+    Log 'Supported login window is stable; waiting for its green button.'
+    for ($attempt=1; $attempt -le $MaxRetries -and (Get-Date) -lt $totalDeadline; $attempt++) {
+        $ready = $false
+        $buttonDeadline = (Get-Date).AddSeconds($ButtonTimeoutSec)
+        while ((Get-Date) -lt $buttonDeadline -and (Get-Date) -lt $totalDeadline) {
+            if (Test-LoginConfirmed) { Log 'Supported main window confirmed. Done.'; return 0 }
+            if (@(Get-WeChatPids).Count -eq 0) { throw 'WeChat exited before login completed.' }
+            Update-WxWindow
+            if ($script:curRender -ne [IntPtr]::Zero -and (Test-InteractiveDesktop) -and (Bring-ToFront $script:curTarget)) {
+                Start-Sleep -Milliseconds 120
+                $info = $null
+                if (Test-ButtonReady ([ref]$info)) { $ready=$true; break }
+            }
+            Start-Sleep -Milliseconds 150
+        }
+        if (-not $ready) { Log "WARN: Login button not ready/visible within $ButtonTimeoutSec seconds."; return 1 }
+        Log "Login attempt $attempt/$MaxRetries (green ratio $($info.Ratio))."
+        if (-not (Invoke-WeChatClick)) { Log 'Window/button changed or activation failed; click skipped.'; continue }
+        $loginDeadline = (Get-Date).AddSeconds($LoginTimeoutSec)
+        while ((Get-Date) -lt $loginDeadline -and (Get-Date) -lt $totalDeadline) {
+            if (Test-LoginConfirmed) { Log 'Supported main window confirmed. Done.'; return 0 }
+            if (@(Get-WeChatPids).Count -eq 0) { throw 'WeChat exited after the click.' }
+            Start-Sleep -Milliseconds 150
+        }
+        Log 'Main window not confirmed yet; rechecking the login button.'
+    }
+    if (Test-LoginConfirmed) { Log 'Supported main window confirmed. Done.'; return 0 }
+    Log 'WARN: Auto-login not completed. Please log in manually; see README.md for troubleshooting.'
+    return 1
+}
 
-if ($ok) { Log "Logged in. Done."; exit 0 }
-else { Log "WARN: 自动登录未完成，请手动点击登录。"; exit 1 }
+$mutex=$null; $ownsMutex=$false
+try {
+    $sid=(Get-WeChatIdentity).User.Value
+    $mutex=New-Object Threading.Mutex($false, "Local\WeChatAutoLogin.$sid")
+    try { $ownsMutex=$mutex.WaitOne(0,$false) } catch [Threading.AbandonedMutexException] { $ownsMutex=$true }
+    if (-not $ownsMutex) { Write-Host 'Another auto-login instance is running; exiting.'; exit 0 }
+    Initialize-WxApi
+    $script:curTarget=[IntPtr]::Zero; $script:curRender=[IntPtr]::Zero
+    exit (Invoke-WeChatAutoLogin)
+} catch { Log "ERROR: $_"; exit 1 }
+finally {
+    if ($ownsMutex) { $mutex.ReleaseMutex() }
+    if ($mutex) { $mutex.Dispose() }
+}

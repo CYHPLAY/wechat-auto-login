@@ -1,0 +1,4 @@
+tests/.work-*/
+*.log
+*.log.1
+*.clixml
