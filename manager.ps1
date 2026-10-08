@@ -41,6 +41,7 @@ function Show-Status {
         Write-Host '  开机入口唯一，无重复项。' -ForegroundColor Green
     }
     Write-Host '--------------------------'
+    Write-Host '开源: https://github.com/CYHPLAY/wechat-auto-login' -ForegroundColor DarkGray
     return $info
 }
 
@@ -124,7 +125,9 @@ if ($Action -ne 'Menu') {
 while ($true) {
     Clear-Host
     Write-Host '==================================' -ForegroundColor Cyan
-    Write-Host '   微信开机自动登录 - 管理工具' -ForegroundColor Cyan
+    Write-Host '   微信开机自动登录' -ForegroundColor Cyan
+    Write-Host '   开机自动打开微信并进入主界面' -ForegroundColor Gray
+    Write-Host '   github.com/CYHPLAY/wechat-auto-login' -ForegroundColor DarkGray
     Write-Host '==================================' -ForegroundColor Cyan
     [void](Show-Status)
     Write-Host ''

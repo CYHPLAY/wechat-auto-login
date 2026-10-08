@@ -25,7 +25,9 @@ internal static class WeChatAutoLoginInstaller
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
         Console.Title = "WeChat AutoLogin";
         Console.WriteLine("==================================================");
-        Console.WriteLine("   微信开机自动登录 - 管理工具");
+        Console.WriteLine("   微信开机自动登录");
+        Console.WriteLine("   开机自动打开微信并进入主界面");
+        Console.WriteLine("   开源: https://github.com/CYHPLAY/wechat-auto-login");
         Console.WriteLine("==================================================");
 
         string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
