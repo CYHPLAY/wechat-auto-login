@@ -348,7 +348,12 @@ public class TestWxApi {
         Assert (Test-Path -LiteralPath $script:testBackup)
         Assert ($script:fakeTask.Actions[0].Arguments.Contains('-WeChatExe "'+$script:testExe+'"'))
         Assert ($script:fakeTask.Principal.LogonType -eq 'Interactive' -and $script:fakeTask.Principal.RunLevel -eq 'Limited')
-        Assert ($script:fakeTask.Trigger.User -eq (Get-WeChatIdentity).User.Value)
+        # Logon trigger/principal use the account name, not the SID: a SID fails when setup runs
+        # via powershell.exe -File under Windows PowerShell 5.1 (HRESULT 0x80070057). The name still
+        # uniquely identifies the current user; owner comparisons continue to resolve against the SID.
+        $identity = Get-WeChatIdentity
+        Assert ($script:fakeTask.Trigger.User -eq $identity.Name)
+        Assert ($script:fakeTask.Principal.UserId -eq $identity.Name)
     }
     Test 'Updating installation retains original backup and rolls back old task on registration failure' {
         Reset-Fixture

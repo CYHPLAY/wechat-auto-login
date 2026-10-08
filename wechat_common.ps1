@@ -23,9 +23,13 @@ function Find-WeChatExe {
                        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
         foreach ($entry in @(Get-ItemProperty -Path $key -ErrorAction SilentlyContinue)) {
             if ($entry.DisplayName -notmatch '(?i)(wechat|weixin|微信)' -or -not $entry.InstallLocation) { continue }
+            # InstallLocation may be quoted in the registry (e.g. '"D:\WeChat\Weixin"'); strip quotes before joining.
+            $installLocation = [string]$entry.InstallLocation.Trim().Trim('"').Trim("'")
             foreach ($name in @('Weixin.exe','WeChat.exe')) {
-                $candidate = Join-Path $entry.InstallLocation $name
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+                try {
+                    $candidate = Join-Path $installLocation $name
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+                } catch {}
             }
         }
     }
@@ -223,8 +227,11 @@ function Install-WeChatAutostart {
     }
     $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mainScript`" -WeChatExe `"$WeChatExe`"" -WorkingDirectory $ScriptDir
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.User.Value
-    $principal = New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Limited
+    # Use the account name (DOMAIN\user), not the SID: when setup runs as "powershell.exe -File"
+    # under Windows PowerShell 5.1, a SID in the logon trigger/principal fails with HRESULT 0x80070057.
+    # The name is resolved at runtime, so no username is hardcoded; owner checks still compare the SID.
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
+    $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
     $taskAttempted = $false
     $backupAttempted = $false
