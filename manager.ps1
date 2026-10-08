@@ -41,7 +41,6 @@ function Show-Status {
         Write-Host '  开机入口唯一，无重复项。' -ForegroundColor Green
     }
     Write-Host '--------------------------'
-    Write-Host '开源: https://github.com/CYHPLAY/wechat-auto-login' -ForegroundColor DarkGray
     return $info
 }
 
