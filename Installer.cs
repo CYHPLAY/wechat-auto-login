@@ -1,14 +1,16 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text;
+using System.Collections.Generic;
 
 internal static class WeChatAutoLoginInstaller
 {
-    // 内嵌资源逻辑名 -> 释放后的真实文件名
+    // Logical resource name -> file released into the temporary directory.
     private static readonly string[][] Files =
     {
+        new string[]{ "wcal.manager",           "manager.ps1" },
         new string[]{ "wcal.setup",             "setup.ps1" },
         new string[]{ "wcal.wechat_autologin",  "wechat_autologin.ps1" },
         new string[]{ "wcal.wechat_common",     "wechat_common.ps1" },
@@ -19,20 +21,19 @@ internal static class WeChatAutoLoginInstaller
 
     private static int Main(string[] args)
     {
-        bool silent = HasArg(args, "-silent") || Console.IsInputRedirected;
+        bool silent = HasFlag(args, "silent");
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
-        Console.Title = "WeChat AutoLogin Setup";
+        Console.Title = "WeChat AutoLogin";
         Console.WriteLine("==================================================");
-        Console.WriteLine("   微信开机自动登录 - 一键安装");
+        Console.WriteLine("   微信开机自动登录 - 管理工具");
         Console.WriteLine("==================================================");
-        Console.WriteLine();
 
         string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         string powershell = Path.Combine(windir, @"System32\WindowsPowerShell\v1.0\powershell.exe");
         if (!File.Exists(powershell))
         {
-            string sys = Environment.GetFolderPath(Environment.SpecialFolder.System);
-            string alt = Path.Combine(sys, @"WindowsPowerShell\v1.0\powershell.exe");
+            string alt = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                @"WindowsPowerShell\v1.0\powershell.exe");
             if (File.Exists(alt)) powershell = alt;
         }
         if (!File.Exists(powershell)) { Fail("未找到 Windows PowerShell。"); return Pause(2, silent); }
@@ -40,11 +41,9 @@ internal static class WeChatAutoLoginInstaller
         string srcDir = Path.Combine(Path.GetTempPath(),
             "WeChatAutoLogin_installer_" + Guid.NewGuid().ToString("N").Substring(0, 8));
         Directory.CreateDirectory(srcDir);
-
         int code;
         try
         {
-            // 1) 释放内嵌脚本到临时目录
             Assembly asm = Assembly.GetExecutingAssembly();
             foreach (string[] f in Files)
             {
@@ -56,38 +55,18 @@ internal static class WeChatAutoLoginInstaller
                 }
             }
 
-            // 2) 调用 setup.ps1 安装到当前用户目录
-            string appDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "WeChatAutoLogin", "app");
-            string setup = Path.Combine(srcDir, "setup.ps1");
-
-            Console.WriteLine("安装目录: " + appDir);
-            Console.WriteLine();
-
+            // No arguments: enter the interactive manager menu. Otherwise forward
+            // install/test/uninstall/status and -silent to manager.ps1.
+            string manager = Path.Combine(srcDir, "manager.ps1");
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = powershell;
-            psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + setup +
-                           "\" -SetupDir \"" + appDir + "\"";
+            psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + manager + "\"" + ForwardArgs(args);
             psi.WorkingDirectory = srcDir;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = false;
             Process p = Process.Start(psi);
             p.WaitForExit();
             code = p.ExitCode;
-            Console.WriteLine();
-
-            if (code == 0)
-            {
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("[成功] 已安装。下次开机登录 Windows 将自动启动并登录微信。");
-                Console.ResetColor();
-                Console.WriteLine("如需立即测试，可运行: Start-ScheduledTask -TaskName 'WeChatAutoLogin'");
-            }
-            else
-            {
-                Fail("安装脚本退出码为 " + code + "，请把上方信息反馈。");
-            }
         }
         catch (Exception ex)
         {
@@ -98,24 +77,86 @@ internal static class WeChatAutoLoginInstaller
         {
             try { Directory.Delete(srcDir, true); } catch { }
         }
-        return Pause(code, silent);
+        return code;
     }
 
-    private static bool HasArg(string[] args, string name)
+    // Accept both "-Action install" and a bare "install"; any form of -silent.
+    // Value options such as -WeChatExe keep their following value; everything else passes through.
+    private static string ForwardArgs(string[] args)
+    {
+        StringBuilder sb = new StringBuilder();
+        bool silent = false;
+        HashSet<string> actions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "install", "test", "uninstall", "status", "menu" };
+        HashSet<string> valueOptions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "wechatexe", "setupdir" };
+
+        if (args != null)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = (args[i] ?? "").Trim();
+                if (a.Length == 0) continue;
+                string key = a.TrimStart('-', '/').ToLowerInvariant();
+                bool bare = !a.StartsWith("-") && !a.StartsWith("/");
+
+                if (key == "silent") { silent = true; continue; }
+
+                if (key == "action")
+                {
+                    string val = null;
+                    int eq = a.IndexOf('=');
+                    if (eq >= 0) val = a.Substring(eq + 1).Trim().Trim('"');
+                    else if (i + 1 < args.Length) val = (args[++i] ?? "").Trim().Trim('"');
+                    if (!string.IsNullOrEmpty(val))
+                    {
+                        string vk = val.TrimStart('-', '/').ToLowerInvariant();
+                        if (actions.Contains(vk)) sb.Append(" -Action ").Append(Capitalize(vk));
+                        else sb.Append(" -Action \"").Append(val).Append("\"");
+                    }
+                    continue;
+                }
+
+                if (bare && actions.Contains(key)) { sb.Append(" -Action ").Append(Capitalize(key)); continue; }
+
+                if (!bare && valueOptions.Contains(key))
+                {
+                    sb.Append(' ').Append(a);
+                    int eq = a.IndexOf('=');
+                    if (eq < 0 && i + 1 < args.Length) sb.Append(' ').Append(QuoteIfNeeded(args[++i]));
+                    continue;
+                }
+
+                sb.Append(' ').Append(a);
+            }
+        }
+        if (silent) sb.Append(" -Silent");
+        return sb.ToString();
+    }
+
+    private static string Capitalize(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        return char.ToUpper(s[0]) + s.Substring(1);
+    }
+
+    private static string QuoteIfNeeded(string v)
+    {
+        v = v ?? "";
+        if (v.Length == 0) return "\"\"";
+        if (v.IndexOf(' ') >= 0 && v[0] != '"') return "\"" + v + "\"";
+        return v;
+    }
+
+    private static bool HasFlag(string[] args, string name)
     {
         if (args == null) return false;
-        foreach (string a in args) if (string.Equals(a, name, StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (string a in args)
+            if (a != null && a.TrimStart('-', '/').Equals(name, StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
 
     private static int Pause(int code, bool silent)
     {
-        if (!silent)
-        {
-            Console.WriteLine();
-            Console.WriteLine("按任意键退出...");
-            try { Console.ReadKey(true); } catch { }
-        }
+        if (!silent) { Console.WriteLine("按任意键退出..."); try { Console.ReadKey(true); } catch { } }
         return code;
     }
 

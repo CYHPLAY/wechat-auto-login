@@ -95,6 +95,82 @@ function Get-WeChatScheduledTask {
     Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -eq 'WeChatAutoLogin' }
 }
 
+function Get-WeChatScheduledTaskAll {
+    # Same-name task in every task path; more than one path means a duplicate registration.
+    @(try { Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -eq 'WeChatAutoLogin' } } catch { @() })
+}
+
+function Get-WeChatCommonStartupFolder { [Environment]::GetFolderPath('CommonStartup') }
+
+function Get-WeChatRunEntries {
+    # WeChat/Weixin values in the per-machine and per-user Run keys.
+    $entries = @()
+    foreach ($hive in @(
+        @{ Hive='HKCU'; Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' },
+        @{ Hive='HKLM'; Path='HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' },
+        @{ Hive='HKLM32'; Path='HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run' })) {
+        if (-not (Test-Path -LiteralPath $hive.Path)) { continue }
+        $props = Get-ItemProperty -LiteralPath $hive.Path
+        foreach ($name in @('Weixin','WeChat')) {
+            if ($props.PSObject.Properties.Name -notcontains $name) { continue }
+            $value = [string]$props.$name
+            if (Test-WeChatRunValue $value) { $entries += [pscustomobject]@{ Hive=$hive.Hive; Name=$name; Value=$value } }
+        }
+    }
+    return $entries
+}
+
+function Get-WeChatStartupShortcutList {
+    # WeChat-related shortcuts in the current-user and common (all-users) Startup folders.
+    $folders = @(@(Get-WeChatStartupFolder) + @(Get-WeChatCommonStartupFolder) | Where-Object { $_ } | Select-Object -Unique)
+    $list = @()
+    if (-not $folders) { return $list }
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        foreach ($folder in $folders) {
+            if (-not (Test-Path -LiteralPath $folder)) { continue }
+            foreach ($file in @(Get-ChildItem -LiteralPath $folder -Filter '*.lnk' -File -ErrorAction SilentlyContinue)) {
+                $shortcut = $shell.CreateShortcut($file.FullName)
+                if (Test-WeChatShortcut $shortcut.TargetPath $shortcut.Arguments) {
+                    $list += [pscustomobject]@{
+                        Path = $file.FullName
+                        IsAutoLogin = ($shortcut.TargetPath -match '(?i)[\\/](powershell|pwsh)\.exe$')
+                    }
+                }
+            }
+        }
+    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    return $list
+}
+
+function Get-WeChatEnvironment {
+    # Aggregated install/autostart state used by the manager menu and duplicate detection.
+    $allTasks = @(Get-WeChatScheduledTaskAll)
+    $primary = @($allTasks | Where-Object { $_.TaskPath -eq '\' }) | Select-Object -First 1
+    if (-not $primary) { $primary = $allTasks | Select-Object -First 1 }
+    $extraTasks = @($allTasks | Where-Object { $_ -ne $primary })
+    $shortcuts = @(Get-WeChatStartupShortcutList)
+    $runItems = @(Get-WeChatRunEntries)
+    $deployDir = Join-Path $env:LOCALAPPDATA 'WeChatAutoLogin\app'
+    $wechatExe = $null
+    try { $wechatExe = Find-WeChatExe } catch { $wechatExe = $null }
+    $entryCount = ($(if ($primary) { 1 } else { 0 }) + $shortcuts.Count + $runItems.Count)
+    [pscustomobject]@{
+        Installed = [bool]$primary
+        PrimaryTask = $primary
+        ExtraTasks = $extraTasks
+        TaskCount = $allTasks.Count
+        StartupShortcuts = $shortcuts
+        RunItems = $runItems
+        ProcessCount = @(Get-WeChatProcesses).Count
+        DeployDir = $deployDir
+        Deployed = Test-Path -LiteralPath $deployDir
+        WeChatExe = $wechatExe
+        AutostartEntryCount = $entryCount
+        HasDuplicates = ($entryCount -gt 1 -or $extraTasks.Count -gt 0)
+    }
+}
+
 function Assert-WeChatTaskOwner($Task) {
     $identity = Get-WeChatIdentity
     $currentSid = [string]$identity.User.Value

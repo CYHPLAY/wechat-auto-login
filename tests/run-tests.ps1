@@ -486,6 +486,32 @@ public class TestWxApi {
         $stopIndex=$script:events.IndexOf('stop'); $removeIndex=$script:events.IndexOf('unregister')
         Assert ($stopIndex -ge 0 -and $removeIndex -gt $stopIndex)
     }
+    Test 'Report clean, single-task and duplicate autostart environments' {
+        function Get-WeChatScheduledTaskAll { $script:envTasks }
+        function Get-WeChatStartupShortcutList { $script:envShortcuts }
+        function Get-WeChatRunEntries { $script:envRuns }
+        function Get-WeChatProcesses { @() }
+        function Find-WeChatExe { 'C:\apps\Weixin.exe' }
+        function New-EnvTask { param($Path) [pscustomobject]@{ TaskName='WeChatAutoLogin'; TaskPath=$Path; State='Ready'; Principal=[pscustomobject]@{UserId='me'}; Actions=@() } }
+
+        $script:envTasks=@(); $script:envShortcuts=@(); $script:envRuns=@()
+        $e = Get-WeChatEnvironment
+        Assert (-not $e.Installed -and -not $e.HasDuplicates -and $e.AutostartEntryCount -eq 0)
+
+        $script:envTasks=@(New-EnvTask '\'); $script:envShortcuts=@(); $script:envRuns=@()
+        $e = Get-WeChatEnvironment
+        Assert ($e.Installed -and -not $e.HasDuplicates -and $e.AutostartEntryCount -eq 1 -and $e.ExtraTasks.Count -eq 0)
+
+        $script:envShortcuts=@([pscustomobject]@{Path='C:\s\wechat.lnk';IsAutoLogin=$false})
+        $script:envRuns=@([pscustomobject]@{Hive='HKCU';Name='Weixin';Value='C:\Weixin.exe'})
+        $e = Get-WeChatEnvironment
+        Assert ($e.HasDuplicates -and $e.AutostartEntryCount -eq 3)
+
+        $script:envTasks=@(New-EnvTask '\'); $script:envTasks += New-EnvTask '\Custom\'
+        $script:envShortcuts=@(); $script:envRuns=@()
+        $e = Get-WeChatEnvironment
+        Assert ($e.HasDuplicates -and $e.ExtraTasks.Count -eq 1)
+    }
 } finally {
     # Verify the resolved target is this test's own scratch directory before deletion.
     $resolved=[IO.Path]::GetFullPath($scratch)

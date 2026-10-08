@@ -2,42 +2,38 @@
 
 Windows 微信开机自动登录：登录 Windows 后自动启动微信，**检测到绿色“进入WeChat”按钮就绪再点击**进入主界面。纯 PowerShell + 系统 API，**零第三方依赖**，自动适配分辨率 / DPI / 微信安装位置，不会多开。
 
-## 一键安装
+## 一键安装（推荐）
 
-**最简单：双击 `WeChatAutoLoginSetup.exe`**，自动识别微信并安装到当前用户，无需命令行、不装任何依赖。
+**双击 `WeChatAutoLoginSetup.exe`** 打开管理菜单，按数字选择：
 
-或用命令行，在项目目录打开 PowerShell 运行：
+- `1` 安装 / 修复：自动找微信、复制脚本、创建登录计划任务 `WeChatAutoLogin`、清理重复开机项
+- `2` 立即测试：等同开机触发一次，并显示结果
+- `3` 卸载：移除计划任务、恢复安装前的开机项
+- 菜单顶部显示安装状态、微信路径、开机自启入口数量；发现多个入口会提示多开风险
+
+装完下次开机登录即自动登录微信，全程不装任何依赖。自动化可静默运行：`WeChatAutoLoginSetup.exe install -silent`（另支持 `test` / `uninstall` / `status`）。
+
+> 不想用 exe，也可在项目目录运行 PowerShell：
+> `powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SetupDir "$env:LOCALAPPDATA\WeChatAutoLogin\app"`
+> 微信装在非默认位置时追加 `-WeChatExe "完整路径\Weixin.exe"`。
+
+## 日志与命令行卸载
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SetupDir "$env:LOCALAPPDATA\WeChatAutoLogin\app"
-```
-
-两种方式都会自动找到微信、复制脚本、创建登录计划任务 `WeChatAutoLogin`、清理重复开机项；装完下次开机登录即自动登录微信。
-
-> 微信装在非默认位置时，命令行方式追加 `-WeChatExe "完整路径\Weixin.exe"`。
-
-## 手动测试
-
-```powershell
-# 立即触发一次（等同开机）
-Start-ScheduledTask -TaskName 'WeChatAutoLogin'
 # 查看运行日志
 Get-Content "$env:LOCALAPPDATA\WeChatAutoLogin\autologin.log" -Tail 30
-```
-
-## 卸载
-
-```powershell
+# 命令行卸载（与 exe 菜单的“卸载”等效）
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\WeChatAutoLogin\app\uninstall.ps1"
 ```
 
-删除计划任务并恢复安装前的开机项；脚本文件保留，可自行删除安装目录。
+卸载会删除计划任务并恢复安装前的开机项；脚本文件保留，可自行删除安装目录。
 
 ## 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
-| `WeChatAutoLoginSetup.exe` | 一键安装程序，双击即可（推荐） |
+| `WeChatAutoLoginSetup.exe` | 一键管理程序，双击打开菜单（推荐） |
+| `manager.ps1` | 管理菜单：状态 / 重复检测 / 安装 / 测试 / 卸载（随 exe 释放） |
 | `setup.ps1` | 命令行一键安装 |
 | `uninstall.ps1` | 卸载并恢复原开机项 |
 | `wechat_autologin.ps1` | 主程序：启动微信、检测按钮、点击登录 |
