@@ -130,6 +130,9 @@ public class TestWxApi {
         $identity=Get-WeChatIdentity
         $task=[pscustomobject]@{Principal=[pscustomobject]@{UserId=$identity.User.Value};Actions=@([pscustomobject]@{Execute='C:\Windows\powershell.exe';Arguments='-File "C:\apps\wechat_autologin.ps1"'})}
         Assert-WeChatTaskOwner $task
+        # Task Scheduler may return the full account name or only the SAM short name; both are still the current user.
+        $task.Principal.UserId=$identity.Name; Assert-WeChatTaskOwner $task
+        $task.Principal.UserId=(Split-Path $identity.Name -Leaf); Assert-WeChatTaskOwner $task
         $task.Principal.UserId='S-1-5-18'; Assert-Throws { Assert-WeChatTaskOwner $task }
         $task.Principal.UserId=$identity.User.Value; $task.Actions[0].Arguments='-File "C:\apps\other.ps1"'
         Assert-Throws { Assert-WeChatTaskOwner $task }

@@ -97,11 +97,23 @@ function Get-WeChatScheduledTask {
 
 function Assert-WeChatTaskOwner($Task) {
     $identity = Get-WeChatIdentity
+    $currentSid = [string]$identity.User.Value
+    $currentName = [string]$identity.Name
+    $currentShort = [string](Split-Path $currentName -Leaf)
     $owner = [string]$Task.Principal.UserId
-    if ($owner -ne $identity.User.Value -and $owner -ne $identity.Name) {
-        try { $owner = (New-Object Security.Principal.NTAccount($owner)).Translate([Security.Principal.SecurityIdentifier]).Value } catch {}
-        if ($owner -ne $identity.User.Value) { throw 'WeChatAutoLogin belongs to another user; it will not be changed.' }
+    $isOwner = ($owner -eq $currentSid -or $owner -ieq $currentName -or $owner -ieq $currentShort)
+    if (-not $isOwner) {
+        # Task Scheduler can normalize the principal to the SAM short name (e.g. "ahao"
+        # instead of "MACHINE\ahao"), which NTAccount cannot translate without a domain
+        # prefix. Retry with common prefixes and compare the resolved SID so SID, full
+        # account name and short name all map back to the same current user.
+        foreach ($account in @($owner, "$env:USERDOMAIN\$owner", "$env:COMPUTERNAME\$owner")) {
+            try {
+                if ((New-Object Security.Principal.NTAccount($account)).Translate([Security.Principal.SecurityIdentifier]).Value -eq $currentSid) { $isOwner = $true; break }
+            } catch {}
+        }
     }
+    if (-not $isOwner) { throw 'WeChatAutoLogin belongs to another user; it will not be changed.' }
     $actions = @($Task.Actions)
     if ($actions.Count -ne 1 -or $actions[0].Execute -notmatch '(?i)[\\/](powershell|pwsh)\.exe$' -or -not (Test-WeChatScriptArgument $actions[0].Arguments)) {
         throw 'WeChatAutoLogin is used by an unrelated task; it will not be changed.'
