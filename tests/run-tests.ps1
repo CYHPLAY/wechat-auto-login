@@ -318,6 +318,25 @@ public class TestWxApi {
             Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:Script:Get-ScheduledTask' -Force -ErrorAction SilentlyContinue
         }
     }
+    Test 'Stop-WeChatProcesses clears every WeChat process and waits for zero' {
+        $savedLister = (Get-Item Function:Script:Get-WeChatAllProcesses).ScriptBlock
+        $script:stopCalls = 0
+        $script:polls = 0
+        function script:Get-WeChatAllProcesses {
+            $script:polls++
+            if ($script:polls -le 2) { return @([pscustomobject]@{Id=101;Name='Weixin'},[pscustomobject]@{Id=102;Name='WeChatAppEx'}) }
+            return @()
+        }
+        function script:Stop-Process { param($Id,$Force) $script:stopCalls++ }
+        try {
+            $count = Stop-WeChatProcesses
+            Assert ($count -eq 2) "expected 2 initial processes, got $count"
+            Assert ($script:stopCalls -eq 2) "expected 2 Stop-Process calls, got $($script:stopCalls)"
+        } finally {
+            Remove-Item Function:Script:Stop-Process -Force -ErrorAction SilentlyContinue
+            function script:Get-WeChatAllProcesses { & $savedLister }
+        }
+    }
     Test 'Write persistent diagnostics and rotate oversized log' {
         Log 'regression-test'
         Assert ((Get-Content -LiteralPath $script:LogPath -Raw) -match 'regression-test')

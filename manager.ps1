@@ -65,7 +65,9 @@ function Invoke-ManagerTest {
     $beforeLines = 0
     if (Test-Path -LiteralPath $log) { $beforeLines = @(Get-Content -LiteralPath $log).Count }
     Write-Host ''
-    Write-Host '立即触发一次自动登录（等同开机）。接下来可能移动鼠标点击微信，请勿操作鼠标键盘...' -ForegroundColor Cyan
+    Write-Host '立即触发一次自动登录：先清除后台微信，再等同开机重新登录。接下来可能移动鼠标，请勿操作鼠标键盘...' -ForegroundColor Cyan
+    $stopped = Stop-WeChatProcesses
+    Write-Host ("已清除后台微信进程 {0} 个，等待重新登录..." -f $stopped) -ForegroundColor DarkGray
     Start-ScheduledTask -TaskName 'WeChatAutoLogin' -TaskPath '\'
     $finished = $false; $ok = $false; $newLines = @()
     # Wait up to 120s for the script's own Done./WARN/ERROR conclusion (a cold boot normally finishes within ~15s).

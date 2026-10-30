@@ -7,6 +7,29 @@ function Get-WeChatProcesses {
     @(Get-Process -Name Weixin,WeChat -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
 }
 
+function Get-WeChatAllProcesses {
+    # Main process plus every helper (e.g. WeChatAppEx); never match the installer itself.
+    $session = (Get-Process -Id $PID).SessionId
+    @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^(weixin|wechat)' -and $_.Name -notmatch 'autologin' -and $_.SessionId -eq $session
+    })
+}
+
+function Stop-WeChatProcesses {
+    # Force the whole WeChat background to exit and wait (up to 10s) until none remains.
+    $initial = @(Get-WeChatAllProcesses)
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $current = @(Get-WeChatAllProcesses)
+        if ($current.Count -eq 0) { break }
+        foreach ($process in $current) {
+            try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch {}
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $initial.Count
+}
+
 function Find-WeChatExe {
     foreach ($process in @(Get-WeChatProcesses)) {
         try { if ($process.Path -and (Test-Path -LiteralPath $process.Path -PathType Leaf)) { return $process.Path } } catch {}
