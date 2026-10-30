@@ -91,8 +91,13 @@ function Test-WeChatRunValue([string]$Value) {
 }
 
 function Get-WeChatScheduledTask {
-    # Do not hide Task Scheduler service/access errors as "task not found".
-    Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -eq 'WeChatAutoLogin' }
+    # An empty root task folder is a normal "not installed" state, not a service error.
+    try {
+        Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -eq 'WeChatAutoLogin' }
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return $null }
+        throw
+    }
 }
 
 function Get-WeChatScheduledTaskAll {

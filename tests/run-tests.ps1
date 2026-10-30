@@ -292,6 +292,32 @@ public class TestWxApi {
         function Update-WxWindow { $script:curRender=[IntPtr]::Zero }
         Assert ((Invoke-WeChatAutoLogin) -eq 1)
     }
+    Test 'Empty root task folder is treated as not installed' {
+        $script:fakeSchedulerMode = 'notfound'
+        function script:Get-ScheduledTask {
+            if ($script:fakeSchedulerMode -eq 'notfound') {
+                $err = New-Object Management.Automation.ErrorRecord(
+                    (New-Object Exception('no MSFT_ScheduledTask')),
+                    'ObjectNotFound',
+                    [Management.Automation.ErrorCategory]::ObjectNotFound,
+                    $null)
+                throw $err
+            }
+            $denied = New-Object Management.Automation.ErrorRecord(
+                (New-Object Exception('scheduler service unavailable')),
+                'PermissionDenied',
+                [Management.Automation.ErrorCategory]::PermissionDenied,
+                $null)
+            throw $denied
+        }
+        try {
+            Assert ($null -eq (Get-WeChatScheduledTask)) 'ObjectNotFound must return null, not throw'
+            $script:fakeSchedulerMode = 'service'
+            Assert-Throws { Get-WeChatScheduledTask } 'scheduler service unavailable'
+        } finally {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Function:Script:Get-ScheduledTask' -Force -ErrorAction SilentlyContinue
+        }
+    }
     Test 'Write persistent diagnostics and rotate oversized log' {
         Log 'regression-test'
         Assert ((Get-Content -LiteralPath $script:LogPath -Raw) -match 'regression-test')
