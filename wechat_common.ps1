@@ -25,7 +25,7 @@ function Stop-WeChatProcesses {
         foreach ($process in $current) {
             try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch {}
         }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 250
     }
     return $initial.Count
 }

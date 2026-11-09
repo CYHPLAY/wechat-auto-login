@@ -14,7 +14,7 @@ param(
     [ValidateRange(0.01,0.99)][double]$BtnY       = 0.773,
     [ValidateRange(0.01,1.0)][double]$GreenRatio = 0.30,
     [ValidateRange(1,10)][int]$MaxRetries    = 5,
-    [ValidateRange(0,10000)][int]$MinReadyMs    = 250,
+    [ValidateRange(0,10000)][int]$MinReadyMs    = 150,
     [ValidateRange(0,120)][int]$ReviveGraceSec   = 12,
     [ValidateRange(1,120)][int]$ReviveIntervalSec = 8,
     [bool]$RestoreMouse = $true,
@@ -236,7 +236,7 @@ function Test-LoginConfirmed {
         if (-not (Test-LoggedIn)) { return $false }
         Update-WxWindow
         if ($script:curRender -ne [IntPtr]::Zero) { return $false }
-        if ($sample -lt 2) { Start-Sleep -Milliseconds 150 }
+        if ($sample -lt 2) { Start-Sleep -Milliseconds 100 }
     }
     return $true
 }
@@ -276,7 +276,7 @@ function Get-WeChatPids { @(Get-WeChatProcesses | Select-Object -ExpandProperty 
 
 function Invoke-WeChatClick {
     if (-not (Bring-ToFront $script:curTarget)) { return $false }
-    Start-Sleep -Milliseconds 120
+    Start-Sleep -Milliseconds 80
     Update-WxWindow
     $info = $null
     if (-not (Test-ButtonReady ([ref]$info))) { return $false }
@@ -345,7 +345,7 @@ function Invoke-WeChatAutoLogin {
                 $nextCheckAt = (Get-Date).AddSeconds($ReviveIntervalSec)
             }
         }
-        Start-Sleep -Milliseconds 150
+        Start-Sleep -Milliseconds 100
     }
     if (-not $loginFound) {
         if (Test-LoginConfirmed) { Log 'Supported main window visible. Done.'; return 0 }
@@ -361,11 +361,11 @@ function Invoke-WeChatAutoLogin {
             if (@(Get-WeChatPids).Count -eq 0) { throw 'WeChat exited before login completed.' }
             Update-WxWindow
             if ($script:curRender -ne [IntPtr]::Zero -and (Test-InteractiveDesktop) -and (Bring-ToFront $script:curTarget)) {
-                Start-Sleep -Milliseconds 120
+                Start-Sleep -Milliseconds 80
                 $info = $null
                 if (Test-ButtonReady ([ref]$info)) { $ready=$true; break }
             }
-            Start-Sleep -Milliseconds 150
+            Start-Sleep -Milliseconds 100
         }
         if (-not $ready) { Log "WARN: Login button not ready/visible within $ButtonTimeoutSec seconds."; return 1 }
         Log "Login attempt $attempt/$MaxRetries (green ratio $($info.Ratio))."
@@ -374,7 +374,7 @@ function Invoke-WeChatAutoLogin {
         while ((Get-Date) -lt $loginDeadline -and (Get-Date) -lt $totalDeadline) {
             if (Test-LoginConfirmed) { Log 'Supported main window confirmed. Done.'; return 0 }
             if (@(Get-WeChatPids).Count -eq 0) { throw 'WeChat exited after the click.' }
-            Start-Sleep -Milliseconds 150
+            Start-Sleep -Milliseconds 100
         }
         Log 'Main window not confirmed yet; rechecking the login button.'
     }
