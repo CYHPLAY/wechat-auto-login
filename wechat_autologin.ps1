@@ -46,6 +46,7 @@ public class WxApi {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool GetUserObjectInformation(IntPtr handle, int index, StringBuilder info, int length, out uint needed);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -70,7 +71,6 @@ public class WxApi {
     try {
         if (-not [WxApi]::SetProcessDpiAwarenessContext([IntPtr](-4))) { [void][WxApi]::SetProcessDPIAware() }
     } catch { [void][WxApi]::SetProcessDPIAware() }
-    Add-Type -AssemblyName System.Windows.Forms
 }
 
 function Log($msg) {
@@ -283,12 +283,14 @@ function Invoke-WeChatClick {
     $x = $info.Cx; $y = $info.Cy
     if ([WxApi]::GetForegroundWindow() -ne $script:curTarget -or
         -not (Test-InteractiveDesktop) -or -not (Test-PointOwnedByWeChat $x $y)) { return $false }
-    $position = [System.Windows.Forms.Cursor]::Position
+    $position = New-Object WxApi+POINT(0,0)
+    [void][WxApi]::GetCursorPos([ref]$position)
     $moved = $false; $buttonDown = $false
     try {
         if (-not [WxApi]::SetCursorPos($x,$y)) { throw 'Could not move cursor; refusing to click.' }
         $moved = $true
-        $current = [System.Windows.Forms.Cursor]::Position
+        $current = New-Object WxApi+POINT(0,0)
+        [void][WxApi]::GetCursorPos([ref]$current)
         if ($current.X -ne $x -or $current.Y -ne $y -or
             [WxApi]::GetForegroundWindow() -ne $script:curTarget -or
             -not (Test-InteractiveDesktop) -or -not (Test-PointOwnedByWeChat $x $y)) { return $false }

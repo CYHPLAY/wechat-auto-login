@@ -59,6 +59,7 @@ public class TestWxApi {
     public static int ReleaseDC(IntPtr h,IntPtr dc) { return 1; }
     public static uint GetPixel(IntPtr dc,int x,int y) { return Color; }
     public static bool SetCursorPos(int x,int y) { if (!MoveOK) return false; TestCursor.Position=new TestPosition(x,y); if (LoseFocusOnMove) Foreground=new IntPtr(999); return true; }
+    public static bool GetCursorPos(out POINT lpPoint) { lpPoint=new POINT(TestCursor.Position.X,TestCursor.Position.Y); return true; }
     public static void mouse_event(uint flags,uint x,uint y,uint data,UIntPtr extra) {
         if (flags==2) { MouseDowns++; if (ThrowOnMouseDown) throw new Exception("simulated mouse failure"); }
         if (flags==4) MouseUps++;
